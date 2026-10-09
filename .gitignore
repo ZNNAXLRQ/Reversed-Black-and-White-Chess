@@ -5,3 +5,7 @@ env/
 ENV/
 env.bak/
 venv.bak/
+
+# 项目文档文件
+plans/
+docs/
