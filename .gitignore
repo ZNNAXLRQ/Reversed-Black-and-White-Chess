@@ -6,6 +6,11 @@ ENV/
 env.bak/
 venv.bak/
 
+# Python 缓存文件
+__pycache__/
+.pytest_cache__/
+
 # 项目文档文件
-plans/
-docs/
+/plans
+/docs
+
