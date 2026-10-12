@@ -77,3 +77,51 @@ def test_sigma_within_bounds_after_epoch_update():
     for s in result.metrics.get("sigma_mean_history", []):
         assert 1e-8 <= s <= 1.0
 
+
+def test_sphere_5d_seed_42_smoke():
+    """5 维 Sphere：f(x)=sum(x^2)，x in [0,1]^5，已知最优 x*=[0]*5，f*=0。"""
+    space = ParameterSpace([0.0] * 5, [1.0] * 5)
+    opt = NCSOptimizer(NCSConfig(T_max=5, population_size=10, sigma0=0.1))
+    result = opt.optimize(Sphere(), space, OptimizationConfig(seed=42))
+    assert np.isfinite(result.best_cost)
+    assert result.best_cost >= 0.0
+    assert result.best_candidate.shape == (5,)
+    assert space.validate(result.best_candidate)
+    assert result.num_evaluations == 10 * (5 + 1)
+
+
+def test_multiple_seeds_stable_and_finite():
+    space = ParameterSpace([0.0] * 5, [1.0] * 5)
+    costs = []
+    for seed in range(6):
+        opt = NCSOptimizer(NCSConfig(T_max=5, population_size=10, sigma0=0.1))
+        result = opt.optimize(Sphere(), space, OptimizationConfig(seed=seed))
+        assert np.isfinite(result.best_cost)
+        assert np.all(np.isfinite(result.best_candidate))
+        assert result.best_cost >= 0.0
+        costs.append(result.best_cost)
+    # Sphere 在 [0,1]^5 上 f(x) <= 5，cost 有界；不硬编码"必须找到全局最优"
+    assert all(0.0 <= c <= 5.0 for c in costs)
+
+
+def test_best_cost_monotonic_non_increasing():
+    space = ParameterSpace([0.0] * 5, [1.0] * 5)
+    result = make_optimizer(T_max=6, population_size=5).optimize(
+        Sphere(), space, OptimizationConfig(seed=42)
+    )
+    hist = result.history
+    assert len(hist) == result.num_iterations + 1
+    for i in range(1, len(hist)):
+        assert hist[i] <= hist[i - 1] + 1e-12
+
+
+def test_best_candidate_not_shared_across_runs():
+    space = ParameterSpace([0.0] * 5, [1.0] * 5)
+    opt = make_optimizer(T_max=3, population_size=4)
+    r1 = opt.optimize(Sphere(), space, OptimizationConfig(seed=42))
+    r2 = opt.optimize(Sphere(), space, OptimizationConfig(seed=42))
+    assert r1.best_candidate is not r2.best_candidate
+    r1.best_candidate[0] = 999.0
+    assert r2.best_candidate[0] != 999.0
+
+

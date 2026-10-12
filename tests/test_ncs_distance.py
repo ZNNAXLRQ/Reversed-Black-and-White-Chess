@@ -62,3 +62,19 @@ def test_correlation_requires_n_gt_1():
     with pytest.raises(ValueError):
         correlation(np.array([[0.0, 0.0]]), np.array([0.1]))
 
+
+def test_correlation_excludes_self():
+    # 三个互不相同的分布；若错误包含自身比较，Corr 会变成 0
+    centers = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
+    sigmas = np.array([0.1, 0.1, 0.1])
+    corr = correlation(centers, sigmas)
+    assert np.all(corr > 0.0)
+    for i in range(3):
+        expected = min(
+            bhattacharyya_distance(centers[i], sigmas[i], centers[j], sigmas[j])
+            for j in range(3)
+            if j != i
+        )
+        assert corr[i] == pytest.approx(expected)
+
+

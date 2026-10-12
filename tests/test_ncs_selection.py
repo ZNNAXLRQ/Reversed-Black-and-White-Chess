@@ -46,3 +46,11 @@ def test_nonfinite_raises():
     with pytest.raises(ValueError):
         selection_decision(1.0, 1.0, np.inf, 1.0, 1.0)
 
+
+def test_same_cost_sets_q_half():
+    # g_old == g_new 且都非 0 -> q_new = 0.5；corr_old=1, corr_new=3 -> c_new=0.75
+    # ratio = 2/3
+    assert selection_decision(2.0, 2.0, 1.0, 3.0, 0.8) is True
+    assert selection_decision(2.0, 2.0, 1.0, 3.0, 0.5) is False
+
+
