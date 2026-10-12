@@ -40,3 +40,16 @@ def count(board, color):
 def clone(board):
     return board.copy()
 
+
+def shift(board, dr, dc):
+    """沿 (dr, dc) 移动棋盘，越界位置填 0：s[r, c] = board[r+dr, c+dc]。"""
+    n = board.shape[0]
+    s = np.zeros_like(board)
+    r0 = max(0, -dr)
+    r1 = min(n, n - dr)
+    c0 = max(0, -dc)
+    c1 = min(n, n - dc)
+    s[r0:r1, c0:c1] = board[r0 + dr:r1 + dr, c0 + dc:c1 + dc]
+    return s
+
+

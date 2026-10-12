@@ -10,7 +10,7 @@ import math
 
 from .board import opponent
 from .evaluator import POSITION_TABLE, evaluate, terminal_utility
-from .rules import apply_move, is_terminal, legal_moves
+from .rules import apply_move, has_legal_move, legal_moves
 
 
 def _order_moves(moves):
@@ -19,15 +19,14 @@ def _order_moves(moves):
 
 
 def _negamax(board, color, depth, alpha, beta, weights):
-    if is_terminal(board):
-        return terminal_utility(board, color)
-    if depth <= 0:
-        return evaluate(board, color, weights)
-
     moves = legal_moves(board, color)
     if not moves:
-        # pass：不消耗深度，切换行动方并翻转分数
-        return -_negamax(board, opponent(color), depth, -beta, -alpha, weights)
+        if has_legal_move(board, opponent(color)):
+            # pass：不消耗深度，切换行动方并翻转分数
+            return -_negamax(board, opponent(color), depth, -beta, -alpha, weights)
+        return terminal_utility(board, color)  # 双方均无合法走法，终局
+    if depth <= 0:
+        return evaluate(board, color, weights)
 
     best = -math.inf
     for move in _order_moves(moves):

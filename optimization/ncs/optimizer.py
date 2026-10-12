@@ -127,6 +127,7 @@ class NCSOptimizer(Optimizer):
         best_idx = int(np.argmin([p.cost for p in processes]))
         best_x = processes[best_idx].x.copy()
         best_cost = processes[best_idx].cost
+        initial_best_z = best_x.copy()
 
         history = [best_cost]
         sigma_mean_history = []
@@ -198,6 +199,7 @@ class NCSOptimizer(Optimizer):
             metrics={
                 "sigma_mean_history": sigma_mean_history,
                 "acceptance_rate_history": acceptance_rate_history,
+                "initial_best_z": initial_best_z.tolist(),
             },
         )
 

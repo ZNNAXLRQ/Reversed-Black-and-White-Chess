@@ -13,4 +13,5 @@ __pycache__/
 # 项目文档文件
 /plans
 /docs
+outputs/
 

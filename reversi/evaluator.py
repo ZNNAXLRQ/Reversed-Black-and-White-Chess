@@ -5,8 +5,8 @@
 """
 import numpy as np
 
-from .board import BOARD_SIZE, COLOR_NONE, DIRECTIONS, count, opponent
-from .rules import legal_moves
+from .board import BOARD_SIZE, COLOR_NONE, DIRECTIONS, count, opponent, shift
+from .rules import count_legal_moves
 
 # 固定位置表 P（8x8），row 0 在顶部；归一化分母固定为 64*120。
 POSITION_TABLE = np.array([
@@ -25,15 +25,12 @@ _CORNERS = [(0, 0), (0, 7), (7, 0), (7, 7)]
 
 def _count_frontier(board, color):
     """frontier disc：8 邻域内至少相邻一个空格的棋子，每枚棋子只计一次。"""
-    rows, cols = np.nonzero(board == color)
-    total = 0
-    for r, c in zip(rows, cols):
-        for dr, dc in DIRECTIONS:
-            rr, cc = r + dr, c + dc
-            if 0 <= rr < BOARD_SIZE and 0 <= cc < BOARD_SIZE and board[rr, cc] == COLOR_NONE:
-                total += 1
-                break
-    return total
+    disc = board == color
+    empty = board == COLOR_NONE
+    frontier = np.zeros_like(board, dtype=bool)
+    for dr, dc in DIRECTIONS:
+        frontier |= disc & shift(empty, dr, dc)
+    return int(np.count_nonzero(frontier))
 
 
 def features(board, perspective):
@@ -53,8 +50,8 @@ def features(board, perspective):
     position_diff = (pos_own - pos_opp) / (64.0 * 120.0)
 
     # 3. mobility_diff = (own_legal - opp_legal) / max(1, own_legal + opp_legal)
-    own_moves = len(legal_moves(board, perspective))
-    opp_moves = len(legal_moves(board, opp))
+    own_moves = count_legal_moves(board, perspective)
+    opp_moves = count_legal_moves(board, opp)
     mobility_diff = (own_moves - opp_moves) / max(1, own_moves + opp_moves)
 
     # 4. corner_diff = (own_corner - opp_corner) / 4
