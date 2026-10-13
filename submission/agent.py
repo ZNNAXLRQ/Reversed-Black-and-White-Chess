@@ -1,48 +1,28 @@
-"""Reversed Reversi AI —— 单文件自包含提交版本（Plan 8）。
-
-固定五项评估特征（顺序不可变）：
-    disc_diff, position_diff, mobility_diff, corner_diff, frontier_diff
-
-固定权重为 Plan 7 验证通过的冠军权重（来源 ncs_seed_43），特征顺序与
-上述五项一一对应；权重界 [-10, 10]，搜索深度固定为 3。
-
-本文件只包含实时比赛所需代码与固定权重；不包含 NCS / 训练 / 实验逻辑，
-不读取任何外部文件，不 import os，不导入任何本地项目模块。
-"""
 import numpy as np
 import numba
 
-# ======================================================================
-# 常量与棋盘辅助函数
-# ======================================================================
+# 游戏规则与基本下棋
+
 COLOR_BLACK = -1
 COLOR_WHITE = 1
 COLOR_NONE = 0
-
 BOARD_SIZE = 8
-
-# 8 个方向增量 (dr, dc)
 DIRECTIONS = [
     (-1, -1), (-1, 0), (-1, 1),
     (0, -1),           (0, 1),
     (1, -1),  (1, 0),  (1, 1),
 ]
 
-
 def opponent(color):
     return -color
-
 
 def in_bounds(row, col):
     return 0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE
 
-
 def count(board, color):
     return int(np.count_nonzero(board == color))
 
-
 def shift(board, dr, dc):
-    """沿 (dr, dc) 移动棋盘，越界位置填 0：s[r, c] = board[r+dr, c+dc]。"""
     n = board.shape[0]
     s = np.zeros_like(board)
     r0 = max(0, -dr)
@@ -52,16 +32,10 @@ def shift(board, dr, dc):
     s[r0:r1, c0:c1] = board[r0 + dr:r1 + dr, c0 + dc:c1 + dc]
     return s
 
-
-# ======================================================================
-# 规则：合法走法、落子翻转、换手/pass
-# ======================================================================
 _DIRECTIONS_NB = np.array(DIRECTIONS, dtype=np.int8)
-
 
 @numba.njit
 def _legal_mask_nb(board, color):
-    """Numba 加速的合法走法掩码（纯循环，编译为机器码）。"""
     n = board.shape[0]
     opp = -color
     legal = np.zeros((n, n), dtype=np.bool_)
@@ -94,9 +68,7 @@ def _legal_mask_nb(board, color):
                     break
     return legal
 
-
 def flips(board, color, row, col):
-    """返回在 (row, col) 落 color 子会翻转的对方棋子坐标列表（不修改棋盘）。"""
     if board[row, col] != COLOR_NONE:
         return []
     captured = []
@@ -111,27 +83,19 @@ def flips(board, color, row, col):
             captured.extend(line)
     return captured
 
-
 def _legal_mask(board, color):
-    """返回 color 的合法走法布尔掩码（8x8）。"""
     return _legal_mask_nb(board, color)
 
-
 def legal_moves(board, color):
-    """返回颜色 color 的所有合法走法 (row, col) 列表。"""
     return [(int(r), int(c)) for r, c in zip(*np.nonzero(_legal_mask(board, color)))]
-
 
 def has_legal_move(board, color):
     return bool(_legal_mask(board, color).any())
 
-
 def count_legal_moves(board, color):
     return int(np.count_nonzero(_legal_mask(board, color)))
 
-
 def apply_move(board, color, move):
-    """返回落子后的新棋盘（原棋盘不变）。"""
     row, col = move
     new_board = board.copy()
     new_board[row, col] = color
@@ -141,10 +105,8 @@ def apply_move(board, color, move):
 
 
 
-# ======================================================================
-# 评估：固定五特征 + 反转终局效用
-# ======================================================================
-# 固定位置表 P（8x8），row 0 在顶部；position_diff 归一化分母固定为 64*120。
+# 评估标准, 博弈辅助
+
 POSITION_TABLE = np.array([
     [120, -20,  20,   5,   5,  20, -20, 120],
     [-20, -40,  -5,  -5,  -5,  -5, -40, -20],
@@ -158,9 +120,7 @@ POSITION_TABLE = np.array([
 
 _CORNERS = [(0, 0), (0, 7), (7, 0), (7, 7)]
 
-
 def _count_frontier(board, color):
-    """frontier disc：8 邻域内至少相邻一个空格的棋子，每枚棋子只计一次。"""
     disc = board == color
     empty = board == COLOR_NONE
     frontier = np.zeros_like(board, dtype=bool)
@@ -168,9 +128,7 @@ def _count_frontier(board, color):
         frontier |= disc & shift(empty, dr, dc)
     return int(np.count_nonzero(frontier))
 
-
 def features(board, perspective):
-    """返回从 perspective 视角计算的 5 特征向量，形状 (5,)。"""
     opp = opponent(perspective)
     own_mask = (board == perspective)
     opp_mask = (board == opp)
@@ -203,17 +161,13 @@ def features(board, perspective):
         dtype=np.float64,
     )
 
-
 def evaluate(board, perspective, weights):
-    """非终局线性评估 E(s; w) = dot(w, features)，权重形状必须为 (5,)。"""
     weights = np.asarray(weights, dtype=np.float64)
     if weights.shape != (5,):
         raise ValueError(f"weights must have shape (5,), got {weights.shape}")
     return float(np.dot(weights, features(board, perspective)))
 
-
 def terminal_utility(board, perspective):
-    """反转黑白棋终局效用（从 perspective 视角）：己方棋子更少者获胜。"""
     own = count(board, perspective)
     opp = count(board, opponent(perspective))
     if own < opp:
@@ -222,15 +176,10 @@ def terminal_utility(board, perspective):
         return -1000.0 + (opp - own)
     return 0.0
 
+# Negamax 搜索与 Alpha-Beta 剪枝
 
-
-# ======================================================================
-# 搜索：Negamax + Alpha-Beta（确定性走法排序）
-# ======================================================================
 def _order_moves(moves):
-    """确定性走法排序：按位置表值降序（角优先），提升 Alpha-Beta 剪枝效率。"""
     return sorted(moves, key=lambda m: POSITION_TABLE[m[0], m[1]], reverse=True)
-
 
 def _negamax(board, color, depth, alpha, beta, weights):
     moves = legal_moves(board, color)
@@ -238,7 +187,8 @@ def _negamax(board, color, depth, alpha, beta, weights):
         if has_legal_move(board, opponent(color)):
             # pass：不消耗深度，切换行动方并翻转分数
             return -_negamax(board, opponent(color), depth, -beta, -alpha, weights)
-        return terminal_utility(board, color)  # 双方均无合法走法，终局
+        # 双方均无合法走法，终局
+        return terminal_utility(board, color)  
     if depth <= 0:
         return evaluate(board, color, weights)
 
@@ -254,9 +204,7 @@ def _negamax(board, color, depth, alpha, beta, weights):
             break
     return best
 
-
 def best_move(board, color, depth, weights):
-    """返回 color 在当前局面下的最佳走法 (row, col)；无合法走法返回 None。"""
     moves = legal_moves(board, color)
     if not moves:
         return None
@@ -276,19 +224,14 @@ def best_move(board, color, depth, weights):
     return best
 
 
-# ======================================================================
-# 固定权重与课程 Agent 接口
-# ======================================================================
-# 固定搜索深度（不进入权重向量）。
+# AI 接口与权重参数
+
 _SEARCH_DEPTH = 3
 
-# Plan 7 验证通过的冠军权重（来源 ncs_seed_43）。
-# 特征顺序：disc_diff, position_diff, mobility_diff, corner_diff, frontier_diff。
 _FIXED_WEIGHTS = np.array(
     [-3.0861110771421476, -10.0, -0.3857156832111528, -7.651743487832784, 0.48587137914320344],
     dtype=np.float64,
 )
-
 
 class AI(object):
     # chessboard_size, color, time_out passed from agent
@@ -315,9 +258,8 @@ class AI(object):
 
         # 搜索选中的合法走法追加到最后，平台取最后一个元素作为决策。
         chosen = best_move(chessboard, self.color, self.depth, self.weights)
-        if chosen is None:  # 防御性兜底，理论上 moves 非空时不会发生
+        if chosen is None: 
             chosen = moves[0]
         self.candidate_list.append(chosen)
 
         return self.candidate_list
-

@@ -11,7 +11,9 @@ __pycache__/
 .pytest_cache__/
 
 # 项目文档文件
-/plans
-/docs
+plans/
+docs/
 outputs/
-
+training/
+artifacts/
+*.log
