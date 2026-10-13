@@ -42,6 +42,7 @@ def decode(z):
 def run_experiment(name, population_size, T_max, seed, out_dir):
     """运行一次 NCS 权重优化，保存结果并返回摘要字典。"""
     space = ParameterSpace([0.0] * 5, [1.0] * 5)
+    # 历史 Plan 6 配置：depth=3 复现历史小预算实验；当前正式训练路径已统一为 depth=4
     objective = ReversiObjective(BASELINE_WEIGHTS, depth=3)
     optimizer = NCSOptimizer(
         NCSConfig(
@@ -59,7 +60,7 @@ def run_experiment(name, population_size, T_max, seed, out_dir):
     best_w = decode(best_z)
     initial_z = np.asarray(result.metrics.get("initial_best_z", best_z), dtype=np.float64)
 
-    # 训练后 H2H 诊断（最佳权重 vs baseline，2 局，不晋级）
+    # 训练后 H2H 诊断（最佳权重 vs baseline，2 局，不晋级）（历史 depth=3 配置）
     h2h = MatchRunner(depth=3).head_to_head(best_w, BASELINE_WEIGHTS, seeds=(501, 502))
 
     summary = {

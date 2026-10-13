@@ -14,6 +14,7 @@
 只负责编排，不重写算法、特征、Objective 或晋级规则。
 """
 import argparse
+import ast
 import hashlib
 import importlib.util
 import json
@@ -48,8 +49,8 @@ SIGMA0 = 0.1
 R = 0.99
 EPOCH = 10
 
-# 搜索深度与对局种子
-DEPTH = 3
+# 搜索深度与对局种子（自本任务起统一为 4，与正式 Agent _SEARCH_DEPTH 一致）
+DEPTH = 4
 TRAINING_GREEDY_SEEDS = (101, 202)
 
 BASELINE_LIST = [float(x) for x in BASELINE_WEIGHTS]
@@ -155,6 +156,101 @@ def backup_submission(logger: Logger, version: int) -> Dict:
         json.dump(meta, f, indent=2, ensure_ascii=False)
     logger.log(f"[backup] submission/agent.py -> {os.path.basename(py_path)} (sha256={short}...)")
     return meta
+
+
+def update_submission_weights(new_weights, logger: Logger) -> Dict:
+    """受保护地把 winner 权重写回 submission/agent.py 的标记块内。
+
+    约束（严格按 Plan 9 第 5.7 节）：
+    - BEGIN/END 标记各恰好出现一次且顺序正确，否则报错停止；
+    - 权重长度 5、全部有限且位于 [-10,10]；
+    - 先备份旧文件并记录 SHA-256；
+    - 只替换标记块内的权重赋值（临时文件 + 原子替换）；
+    - 写回后验证标记仍唯一、文件语法可编译、标记外内容未变、实际权重对应；
+    - 任一检查失败，自动恢复备份并抛错。
+    """
+    begin = "# BEGIN AUTO-UPDATED FINAL WEIGHTS"
+    end = "# END AUTO-UPDATED FINAL WEIGHTS"
+
+    w = np.asarray(new_weights, dtype=np.float64)
+    if w.shape != (5,):
+        raise RuntimeError(f"weights must have shape (5,), got {w.shape}")
+    if not np.all(np.isfinite(w)):
+        raise RuntimeError("weights must be finite")
+    if np.any(w < WEIGHT_LOWER) or np.any(w > WEIGHT_UPPER):
+        raise RuntimeError(f"weights must be within [{WEIGHT_LOWER}, {WEIGHT_UPPER}]")
+
+    with open(_SUBMISSION_PATH, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    if content.count(begin) != 1 or content.count(end) != 1:
+        raise RuntimeError(
+            f"marker block must appear exactly once each "
+            f"(BEGIN={content.count(begin)}, END={content.count(end)})"
+        )
+    b_idx = content.index(begin)
+    e_idx = content.index(end)
+    if b_idx >= e_idx:
+        raise RuntimeError("marker order invalid: BEGIN must precede END")
+
+    old_sha = sha256_file(_SUBMISSION_PATH)
+    os.makedirs(_SUBMISSION_VERSIONS_DIR, exist_ok=True)
+    backup_path = os.path.join(
+        _SUBMISSION_VERSIONS_DIR, f"agent_pre_writeback_{old_sha[:12]}.py"
+    )
+    with open(_SUBMISSION_PATH, "rb") as src, open(backup_path, "wb") as dst:
+        dst.write(src.read())
+
+    end_idx = e_idx + len(end)
+    before = content[:b_idx]
+    after = content[end_idx:]
+    weights_repr = ", ".join(repr(float(x)) for x in w)
+    new_block = (
+        begin + "\n"
+        "_FIXED_WEIGHTS = np.array(\n"
+        "    [" + weights_repr + "],\n"
+        "    dtype=np.float64,\n"
+        ")\n"
+        + end
+    )
+    new_content = before + new_block + after
+
+    try:
+        ast.parse(new_content)
+    except SyntaxError as exc:
+        raise RuntimeError(f"new submission content does not compile: {exc}") from exc
+
+    tmp_path = _SUBMISSION_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    try:
+        os.replace(tmp_path, _SUBMISSION_PATH)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+    try:
+        with open(_SUBMISSION_PATH, "r", encoding="utf-8") as f:
+            written = f.read()
+        if written.count(begin) != 1 or written.count(end) != 1:
+            raise RuntimeError("marker block not unique after writeback")
+        wb = written.index(begin)
+        we = written.index(end) + len(end)
+        if written[:wb] != before or written[we:] != after:
+            raise RuntimeError("content outside marker block changed")
+        loaded = load_submission_weights(_SUBMISSION_PATH)
+        if not np.allclose(loaded, w):
+            raise RuntimeError(f"written weights {loaded.tolist()} != expected {w.tolist()}")
+    except Exception:
+        with open(backup_path, "rb") as src, open(_SUBMISSION_PATH, "wb") as dst:
+            dst.write(src.read())
+        raise
+
+    new_sha = sha256_file(_SUBMISSION_PATH)
+    logger.log(f"[writeback] submission weights updated: {old_sha[:12]} -> {new_sha[:12]}")
+    return {"updated": True, "old_sha256": old_sha, "new_sha256": new_sha, "backup_path": backup_path}
 
 
 def validate_weights(weights, runner: MatchRunner, greedy_seeds) -> Dict:
@@ -359,17 +455,24 @@ def run_plan9_cycle(
     update_applied = False
     old_version = version
     new_version = version
+    writeback_info = None
     if do_h2h and promoted:
-        update_applied = True
-        new_version = version + 1
         logger.log(f"[promote] H2H mean_u={res.mean_u:.6f} > 0 -> candidate qualified for promotion")
+        try:
+            writeback_info = update_submission_weights(challenger_weights, logger)
+            update_applied = bool(writeback_info["updated"])
+            new_version = version + 1
+        except Exception as exc:
+            logger.log(f"[promote] writeback FAILED: {exc}")
     elif do_h2h:
         logger.log(f"[promote] H2H mean_u={res.mean_u:.6f} <= 0 -> keep incumbent (no update)")
     else:
         logger.log("[promote] validation gate not passed -> keep incumbent (no update)")
 
-    if do_h2h and promoted:
+    if do_h2h and promoted and update_applied:
         reason = None
+    elif do_h2h and promoted:
+        reason = "promotion qualified but submission writeback failed"
     elif do_h2h:
         reason = "H2H mean_u <= 0 (no promotion)"
     else:
@@ -406,6 +509,7 @@ def run_plan9_cycle(
         },
         "submission_updated": update_applied,
         "reason_not_updated": reason,
+        "writeback": writeback_info,
     }
     with open(os.path.join(run_dir, "promotion.json"), "w", encoding="utf-8") as f:
         json.dump(promotion, f, indent=2, ensure_ascii=False)

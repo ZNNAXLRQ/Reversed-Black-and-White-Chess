@@ -49,7 +49,7 @@ def hammer_frontier(n_iters=500_000):
 
 
 def hammer_games(n_games=800, depth=3):
-    """跑完整深度-3 对局，观察在哪个对局发生原生崩溃。"""
+    """跑完整深度-3 对局，观察在哪个对局发生原生崩溃。（历史崩溃复现配置，保留 depth=3）"""
     print(f"[probe] playing {n_games} full depth-{depth} games ...", flush=True)
     w = np.array([-3.0861110771421476, -10.0, -0.3857156832111528, -7.651743487832784, 0.48587137914320344])
     t0 = time.time()

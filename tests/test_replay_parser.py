@@ -92,8 +92,10 @@ def test_chosen_move_in_legal_and_flips_match():
 
 
 def test_reconstruct_all_training_files_legal():
+    # 动态发现训练目录下所有现存 chess_log_*.txt（Plan 10 时为 12 个，现已扩展到更多），
+    # 逐个验证能由项目真实规则合法重放；不得用固定数量掩盖真实数据规模变化。
     files = _training_files()
-    assert len(files) == 12
+    assert len(files) >= 12, f"至少应有 12 个基线棋谱，当前 {len(files)} 个"
     for name in files:
         snaps = parse_snapshots(_read_raw(name).decode("utf-8"))
         actions, terminal = reconstruct_game(snaps)
@@ -117,13 +119,14 @@ def test_confirmed_file_metadata():
 def test_all_chess_log_n_get_black_white_strong():
     # 约束：所有 chess_log_n 文件我方黑、对方白、对手均视为强对手（我方失败对局），
     # 且对手不来自同一个强对手（每个文件 opponent_id 独立未知）。
-    for n in range(1, 13):
-        meta = determine_metadata(f"chess_log_{n}.txt")
+    # 动态发现现存全部 chess_log_*.txt，而非固定数量。
+    for name in _training_files():
+        meta = determine_metadata(name)
         assert meta["self_color"] == COLOR_BLACK
         assert meta["opponent_color"] == COLOR_WHITE
         assert meta["opponent_strength"] == "strong"
         assert meta["metadata_source"] == "user_confirmed"
-        assert meta["opponent_id"] == f"unknown:chess_log_{n}.txt"
+        assert meta["opponent_id"] == f"unknown:{name}"
 
 
 def test_other_file_metadata_unknown():

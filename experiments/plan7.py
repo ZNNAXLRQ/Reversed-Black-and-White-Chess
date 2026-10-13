@@ -42,7 +42,7 @@ SIGMA0 = 0.1
 R = 0.99
 EPOCH = 10
 
-# 搜索深度与对局种子
+# 搜索深度与对局种子（历史 Plan 7 配置，depth=3 用于复现历史冠军；当前正式训练路径 plan9.py 已统一为 depth=4）
 DEPTH = 3
 TRAINING_GREEDY_SEEDS = (101, 202)
 VALIDATION_GREEDY_SEEDS = (303, 404)

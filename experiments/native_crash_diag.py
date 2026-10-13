@@ -270,13 +270,13 @@ def cmd_timeline(args):
     log = TimelineLogger(args.out)
     log.line(
         f"[timeline] seed={args.seed} N=10 T_max=20 sigma0=0.1 r=0.99 epoch=10 "
-        f"max_evals={args.max_evals} depth=3 greedy=(101,202)"
+        f"max_evals={args.max_evals} depth=3 greedy=(101,202) (历史崩溃复现配置)"
     )
     log.line(f"[timeline] python={sys.version.split()[0]} numpy={np.__version__} rss={rss_str()}")
 
     space = ParameterSpace([0.0] * 5, [1.0] * 5)
     objective = DiagObjective(
-        BASELINE_WEIGHTS, depth=3, greedy_seeds=(101, 202), log=log, verbose=args.phase_log
+        BASELINE_WEIGHTS, depth=3, greedy_seeds=(101, 202), log=log, verbose=args.phase_log  # 历史 depth=3 复现配置
     )
     optimizer = NCSOptimizer(
         NCSConfig(T_max=20, population_size=10, sigma0=0.1, r=0.99, epoch=10)

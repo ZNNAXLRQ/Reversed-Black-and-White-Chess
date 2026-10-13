@@ -1,7 +1,7 @@
 """Plan 7 本地可用性与压力测试（离线脚本，不进入正式 Agent）。
 
 检查项：
-- 完整深度 3 对局闭环（走法合法性 + 终局判定）；
+- 完整对局闭环（SEARCH_DEPTH=4，走法合法性 + 终局判定）；
 - candidate_list 结构（全部合法走法 + 选中走法在末尾）；
 - 无合法走法返回空列表；
 - 单步耗时 / 整局耗时（<5s / <180s）；
@@ -83,7 +83,7 @@ def main():
     warmup_s = time.time() - t0
     print(f"warmup (JIT compile) = {warmup_s:.3f}s")
 
-    # 完整深度 3 对局。
+    # 完整对局（SEARCH_DEPTH=4）。
     board = initial_board()
     color = COLOR_BLACK
     steps = 0

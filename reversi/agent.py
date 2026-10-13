@@ -16,7 +16,7 @@ from .search import best_move
 BASELINE_WEIGHTS = np.array([-1.0, 1.0, 1.0, 1.0, -1.0], dtype=np.float64)
 
 # 权重实验统一搜索深度（搜索深度不进入 NCS 权重向量）。
-SEARCH_DEPTH = 3
+SEARCH_DEPTH = 4
 
 
 class AI(object):

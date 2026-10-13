@@ -17,7 +17,7 @@ DECODE_OFFSET = -10.0
 class ReversiObjective:
     """候选权重（归一化 z ∈ [0,1]^5）的固定训练目标。"""
 
-    def __init__(self, baseline_weights, depth=3, greedy_seeds=(101, 202)):
+    def __init__(self, baseline_weights, depth=4, greedy_seeds=(101, 202)):
         self.baseline_weights = np.asarray(baseline_weights, dtype=np.float64)
         if self.baseline_weights.shape != (5,):
             raise ValueError(

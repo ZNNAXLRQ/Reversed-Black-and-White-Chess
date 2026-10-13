@@ -103,8 +103,6 @@ def apply_move(board, color, move):
         new_board[r, c] = color
     return new_board
 
-
-
 # 评估标准, 博弈辅助
 
 POSITION_TABLE = np.array([
@@ -223,15 +221,16 @@ def best_move(board, color, depth, weights):
             alpha = score
     return best
 
-
 # AI 接口与权重参数
 
-_SEARCH_DEPTH = 3
+_SEARCH_DEPTH = 4
 
+# BEGIN AUTO-UPDATED FINAL WEIGHTS
 _FIXED_WEIGHTS = np.array(
     [-3.0861110771421476, -10.0, -0.3857156832111528, -7.651743487832784, 0.48587137914320344],
     dtype=np.float64,
 )
+# END AUTO-UPDATED FINAL WEIGHTS
 
 class AI(object):
     # chessboard_size, color, time_out passed from agent

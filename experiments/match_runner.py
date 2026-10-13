@@ -56,7 +56,7 @@ class H2HResult:
 class WeightedAgent:
     """权重 AI：使用给定权重与搜索深度（确定性走法顺序）。"""
 
-    def __init__(self, weights, depth=3):
+    def __init__(self, weights, depth=4):
         self.weights = np.asarray(weights, dtype=np.float64)
         self.depth = depth
 
@@ -86,7 +86,7 @@ class GreedyAgent:
 class MatchRunner:
     """对局运行器：play_game / evaluate_candidate / head_to_head。"""
 
-    def __init__(self, depth=3):
+    def __init__(self, depth=4):
         self.depth = depth
 
     def play_game(self, black_agent, white_agent, seed=None) -> GameResult:
