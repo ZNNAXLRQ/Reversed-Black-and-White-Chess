@@ -1,11 +1,13 @@
 """Plan 11：构建无棋局泄漏的强对手走法偏好数据集。
 
 从 Plan 10 的标准化输出（game_manifest.csv + processed/<game_id>/summary.json + moves.jsonl）
-中选取 opponent_strength=strong 的对局，仅以强对手的实际落子构建单步静态评分偏好样本。
+中选取 opponent_strength=strong 且「对手获胜（我方失败，winner==opponent_color）」的对局，
+仅以强对手的实际落子构建单步静态评分偏好样本。我方获胜或平局的对局不纳入。
 
 本阶段只生成数据集与特征，不运行 NCS、不修改提交权重。
 
 关键约束：
+- 仅纳入 opponent_strength=strong 且 winner==opponent_color（我方失败）的对局；
 - 仅在 side_to_move == opponent_color 的决策状态生成示范样本；
 - 只有多个合法走法的状态才进入偏好损失样本（单合法走法的 forced move 只计数不进入）；
 - 以 game_id 为单位先打乱再切分（固定种子 42），绝不以单条 move 为单位切分；
@@ -134,6 +136,17 @@ def discover_eligible_games(manifest_rows: List[Dict], processed_dir: str) -> Tu
                 "reason": "not_replayed_or_not_terminal",
                 "rule_validation_status": summary.get("rule_validation_status"),
                 "terminal": summary.get("terminal"),
+            })
+            continue
+
+        # 数据选择规则：只把「我方失败」（对手获胜）的对局当作强对手示范；我方获胜或平局排除。
+        winner = summary.get("winner")
+        if winner is None or int(winner) != int(opp_color):
+            excluded.append({
+                "game_id": game_id,
+                "reason": "self_won_or_draw_excluded",
+                "winner": winner,
+                "opponent_color": opp_color,
             })
             continue
 

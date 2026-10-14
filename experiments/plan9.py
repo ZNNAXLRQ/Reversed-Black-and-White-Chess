@@ -37,6 +37,8 @@ _ARTIFACTS_DIR = os.path.join(_PROJECT_ROOT, "artifacts")
 _TRAINING_RUNS_DIR = os.path.join(_ARTIFACTS_DIR, "training_runs")
 _SUBMISSION_VERSIONS_DIR = os.path.join(_ARTIFACTS_DIR, "submission_versions")
 _SUBMISSION_PATH = os.path.join(_PROJECT_ROOT, "submission", "agent.py")
+_CANDIDATES_DIR = os.path.join(_PROJECT_ROOT, "training", "candidates")
+_CANDIDATE_REGISTRY_PATH = os.path.join(_CANDIDATES_DIR, "candidate_registry.json")
 
 FEATURE_NAMES = ["disc_diff", "position_diff", "mobility_diff", "corner_diff", "frontier_diff"]
 WEIGHT_LOWER = -10.0
@@ -278,6 +280,103 @@ def validate_weights(weights, runner: MatchRunner, greedy_seeds) -> Dict:
     }
 
 
+_TERMINAL_CANDIDATE_STATUSES = ("promoted", "evaluated", "rejected")
+
+
+def _load_evaluated_candidate_ids() -> set:
+    """从 candidate_registry.json 读取已被评估/终态的 candidate_id 集合。"""
+    if not os.path.exists(_CANDIDATE_REGISTRY_PATH):
+        return set()
+    try:
+        with open(_CANDIDATE_REGISTRY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return {
+        rec.get("candidate_id")
+        for rec in data.get("candidates", [])
+        if rec.get("evaluated_in_cycle") or rec.get("status") in _TERMINAL_CANDIDATE_STATUSES
+    }
+
+
+def select_preference_candidate(logger: Logger) -> Optional[Dict]:
+    """按 Plan 9 第 4 节选择第一个符合条件的未评估偏好候选。
+
+    条件：eligible_for_match_evaluation=true；特征顺序与当前代码一致；五个权重有限且
+    都在 [-10,10]；存在 dataset_id/preference_run_id/validation_loss 可追溯；且未被评估。
+    按 candidate_id 字典序升序取第一个；不合格候选跳过并记录原因。
+    """
+    os.makedirs(_CANDIDATES_DIR, exist_ok=True)
+    evaluated = _load_evaluated_candidate_ids()
+    files = sorted(
+        f for f in os.listdir(_CANDIDATES_DIR)
+        if f.startswith("preference_candidate_") and f.endswith(".json")
+    )
+    for fname in files:
+        path = os.path.join(_CANDIDATES_DIR, fname)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cand = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.log(f"[pref] skip {fname}: read error {exc}")
+            continue
+        cid = cand.get("candidate_id", fname)
+        if not cand.get("eligible_for_match_evaluation"):
+            logger.log(f"[pref] skip {cid}: eligible_for_match_evaluation != true")
+            continue
+        if list(cand.get("feature_names", [])) != list(FEATURE_NAMES):
+            logger.log(f"[pref] skip {cid}: feature_names mismatch")
+            continue
+        try:
+            w = np.asarray(cand.get("weights"), dtype=np.float64)
+        except (TypeError, ValueError):
+            logger.log(f"[pref] skip {cid}: weights unreadable")
+            continue
+        if w.shape != (5,) or not np.all(np.isfinite(w)) or np.any(w < WEIGHT_LOWER) or np.any(w > WEIGHT_UPPER):
+            logger.log(f"[pref] skip {cid}: weights invalid (shape/NaN/out-of-bounds)")
+            continue
+        if not cand.get("dataset_id") or not cand.get("preference_run_id") or "validation_loss" not in cand:
+            logger.log(f"[pref] skip {cid}: missing traceability fields")
+            continue
+        if cid in evaluated or cand.get("status") in _TERMINAL_CANDIDATE_STATUSES:
+            logger.log(f"[pref] skip {cid}: already evaluated / terminal status")
+            continue
+        logger.log(f"[pref] selected candidate_id={cid}")
+        return cand
+    return None
+
+
+def record_preference_candidate_evaluated(candidate_id: str, outcome: str, logger: Logger) -> None:
+    """在 candidate_registry.json 中追加该候选已评估标记（不篡改候选原始文件）。"""
+    os.makedirs(_CANDIDATES_DIR, exist_ok=True)
+    data: Dict = {"candidates": []}
+    if os.path.exists(_CANDIDATE_REGISTRY_PATH):
+        try:
+            with open(_CANDIDATE_REGISTRY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            data = {"candidates": []}
+    found = False
+    for rec in data.get("candidates", []):
+        if rec.get("candidate_id") == candidate_id:
+            rec["evaluated_in_cycle"] = True
+            rec["evaluation_outcome"] = outcome
+            rec["evaluated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            found = True
+            break
+    if not found:
+        data.setdefault("candidates", []).append({
+            "candidate_id": candidate_id,
+            "evaluated_in_cycle": True,
+            "evaluation_outcome": outcome,
+            "evaluated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    with open(_CANDIDATE_REGISTRY_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    logger.log(f"[pref] recorded evaluated candidate_id={candidate_id} outcome={outcome}")
+
+
 def run_plan9_cycle(
     cycle_index: int,
     training_seed: int,
@@ -390,122 +489,186 @@ def run_plan9_cycle(
     )
     logger.log(f"[train] BestFound weights={np.round(challenger_weights, 9).tolist()}")
 
-    # Step 3：候选与 incumbent 的同协议独立验证。
-    logger.log("[validation] challenger vs incumbent (same protocol) ...")
+    # Step 3：构建 challenger 列表（总是 match_ncs_candidate；若存在合格偏好候选，另纳入）。
+    preference_candidate = select_preference_candidate(logger)
+    challengers = [{
+        "kind": "match_ncs",
+        "candidate_id": None,
+        "weights": challenger_weights,
+        "pref_meta": None,
+    }]
+    if preference_candidate is None:
+        logger.log("[pref] preference_candidate_available=false")
+    else:
+        logger.log(
+            f"[pref] preference_candidate_available=true "
+            f"candidate_id={preference_candidate['candidate_id']}"
+        )
+        challengers.append({
+            "kind": "preference",
+            "candidate_id": preference_candidate["candidate_id"],
+            "weights": np.asarray(preference_candidate["weights"], dtype=np.float64),
+            "pref_meta": {
+                "candidate_id": preference_candidate["candidate_id"],
+                "dataset_id": preference_candidate.get("dataset_id"),
+                "preference_run_id": preference_candidate.get("preference_run_id"),
+                "validation_loss": preference_candidate.get("validation_loss"),
+                "baseline_validation_loss": preference_candidate.get("baseline_validation_loss"),
+                "train_loss": preference_candidate.get("train_loss"),
+                "test_loss": preference_candidate.get("test_loss"),
+            },
+        })
+
+    # Step 4：同一配置下独立实战验证（incumbent + 每个 challenger）。
+    logger.log("[validation] challengers vs incumbent (same protocol) ...")
     runner = MatchRunner(depth=DEPTH)
-    candidate_validation = validate_weights(challenger_weights, runner, validation_seeds)
     incumbent_validation = validate_weights(incumbent_weights, runner, validation_seeds)
-    with open(os.path.join(run_dir, "candidate_validation.json"), "w", encoding="utf-8") as f:
-        json.dump(candidate_validation, f, indent=2, ensure_ascii=False)
+    incumbent_cost = incumbent_validation["cost"]
     with open(os.path.join(run_dir, "incumbent_validation.json"), "w", encoding="utf-8") as f:
         json.dump(incumbent_validation, f, indent=2, ensure_ascii=False)
     logger.log(
-        f"[validation] challenger cost={candidate_validation['cost']:.9f} "
-        f"mean_u={candidate_validation['mean_u']:.6f} "
-        f"W/D/L={candidate_validation['wins']}/{candidate_validation['draws']}/{candidate_validation['losses']}"
-    )
-    logger.log(
-        f"[validation] incumbent  cost={incumbent_validation['cost']:.9f} "
+        f"[validation] incumbent cost={incumbent_cost:.9f} "
         f"mean_u={incumbent_validation['mean_u']:.6f} "
         f"W/D/L={incumbent_validation['wins']}/{incumbent_validation['draws']}/{incumbent_validation['losses']}"
     )
 
-    challenger_cost = candidate_validation["cost"]
-    incumbent_cost = incumbent_validation["cost"]
-    do_h2h = challenger_cost < incumbent_cost
-
-    # Step 4：H2H（仅当验证门槛通过）。
-    h2h: Optional[Dict] = None
-    promoted = False
-    res = None
-    if do_h2h:
+    for ch in challengers:
+        ch["validation"] = validate_weights(ch["weights"], runner, validation_seeds)
+        ch["validation_cost"] = ch["validation"]["cost"]
+        label = ch["candidate_id"] or "match_ncs_candidate"
         logger.log(
-            f"[h2h] validation gate passed ({challenger_cost:.9f} < {incumbent_cost:.9f}), "
-            f"running H2H seeds={h2h_seeds} ..."
+            f"[validation] {label} cost={ch['validation_cost']:.9f} "
+            f"mean_u={ch['validation']['mean_u']:.6f} "
+            f"W/D/L={ch['validation']['wins']}/{ch['validation']['draws']}/{ch['validation']['losses']}"
         )
-        res = runner.head_to_head(challenger_weights, incumbent_weights, seeds=h2h_seeds)
-        h2h = {
+        ch["do_h2h"] = ch["validation_cost"] < incumbent_cost
+
+    match_val = next(c for c in challengers if c["kind"] == "match_ncs")["validation"]
+    with open(os.path.join(run_dir, "candidate_validation.json"), "w", encoding="utf-8") as f:
+        json.dump(match_val, f, indent=2, ensure_ascii=False)
+    with open(os.path.join(run_dir, "match_ncs_candidate_validation.json"), "w", encoding="utf-8") as f:
+        json.dump(match_val, f, indent=2, ensure_ascii=False)
+    if preference_candidate is not None:
+        pref = next(c for c in challengers if c["kind"] == "preference")
+        pref_val = dict(pref["validation"])
+        pref_val["candidate_id"] = pref["candidate_id"]
+        pref_val["preference_meta"] = pref["pref_meta"]
+        with open(os.path.join(run_dir, "preference_candidate_validation.json"), "w", encoding="utf-8") as f:
+            json.dump(pref_val, f, indent=2, ensure_ascii=False)
+
+    # Step 5：H2H（仅对通过验证门槛的 challenger）。
+    for ch in challengers:
+        ch["h2h"] = None
+        ch["qualified"] = False
+        label = ch["candidate_id"] or "match_ncs_candidate"
+        if not ch["do_h2h"]:
+            logger.log(
+                f"[h2h] skip {label}: validation cost ({ch['validation_cost']:.9f}) "
+                f">= incumbent ({incumbent_cost:.9f})"
+            )
+            continue
+        logger.log(f"[h2h] {label} validation gate passed, running H2H seeds={h2h_seeds} ...")
+        res = runner.head_to_head(ch["weights"], incumbent_weights, seeds=h2h_seeds)
+        ch["h2h"] = {
             "u_values": list(res.u_values),
             "mean_u": res.mean_u,
             "challenger_wins": res.challenger_wins,
             "games": [
-                {
-                    "black_count": g.black_count,
-                    "white_count": g.white_count,
-                    "steps": g.steps,
-                    "seed": g.seed,
-                }
+                {"black_count": g.black_count, "white_count": g.white_count,
+                 "steps": g.steps, "seed": g.seed}
                 for g in res.games
             ],
         }
-        with open(os.path.join(run_dir, "h2h.json"), "w", encoding="utf-8") as f:
-            json.dump(h2h, f, indent=2, ensure_ascii=False)
+        ch["qualified"] = res.mean_u > 0.0
+        h2h_fname = "h2h.json" if ch["kind"] == "match_ncs" else f"h2h_preference_{ch['candidate_id']}.json"
+        with open(os.path.join(run_dir, h2h_fname), "w", encoding="utf-8") as f:
+            json.dump(ch["h2h"], f, indent=2, ensure_ascii=False)
         logger.log(
-            f"[h2h] u_values={h2h['u_values']} mean_u={res.mean_u:.6f} "
-            f"challenger_wins={res.challenger_wins}"
-        )
-        promoted = res.mean_u > 0.0
-    else:
-        logger.log(
-            f"[h2h] skipped: challenger validation cost ({challenger_cost:.9f}) "
-            f">= incumbent ({incumbent_cost:.9f})"
+            f"[h2h] {label} u_values={ch['h2h']['u_values']} "
+            f"mean_u={res.mean_u:.6f} challenger_wins={res.challenger_wins}"
         )
 
-    # Step 5：晋级判断与（若晋级）更新提交权重。
+    # Step 6：当多个候选通过时的唯一选择规则。
+    qualified = [c for c in challengers if c["qualified"]]
+    winner = None
+    if len(qualified) == 1:
+        winner = qualified[0]
+    elif len(qualified) > 1:
+        qualified.sort(key=lambda c: (
+            -c["h2h"]["mean_u"],
+            c["validation_cost"],
+            0 if c["kind"] == "match_ncs" else 1,
+        ))
+        winner = qualified[0]
+
+    # Step 7：更新 submission（仅 winner）。
     update_applied = False
     old_version = version
     new_version = version
     writeback_info = None
-    if do_h2h and promoted:
-        logger.log(f"[promote] H2H mean_u={res.mean_u:.6f} > 0 -> candidate qualified for promotion")
+    reason = None
+    if winner is not None:
+        winner_label = winner["candidate_id"] or "match_ncs_candidate"
+        logger.log(
+            f"[promote] winner={winner_label} h2h_mean_u={winner['h2h']['mean_u']:.6f} "
+            f"validation_cost={winner['validation_cost']:.9f}"
+        )
         try:
-            writeback_info = update_submission_weights(challenger_weights, logger)
+            writeback_info = update_submission_weights(winner["weights"], logger)
             update_applied = bool(writeback_info["updated"])
             new_version = version + 1
         except Exception as exc:
             logger.log(f"[promote] writeback FAILED: {exc}")
-    elif do_h2h:
-        logger.log(f"[promote] H2H mean_u={res.mean_u:.6f} <= 0 -> keep incumbent (no update)")
+            reason = "promotion qualified but submission writeback failed"
     else:
-        logger.log("[promote] validation gate not passed -> keep incumbent (no update)")
-
-    if do_h2h and promoted and update_applied:
+        reason = "no challenger passed both validation and H2H"
+        logger.log("[promote] no winner -> keep incumbent (no update)")
+    if winner is not None and update_applied:
         reason = None
-    elif do_h2h and promoted:
-        reason = "promotion qualified but submission writeback failed"
-    elif do_h2h:
-        reason = "H2H mean_u <= 0 (no promotion)"
-    else:
-        reason = "challenger validation cost >= incumbent validation cost"
+
+    # Step 8：记录偏好候选消费状态（无论通过还是拒绝）。
+    if preference_candidate is not None:
+        pref = next(c for c in challengers if c["kind"] == "preference")
+        outcome = (
+            "promoted" if (winner is pref and update_applied)
+            else ("qualified_not_promoted" if pref["qualified"] else "not_qualified")
+        )
+        record_preference_candidate_evaluated(pref["candidate_id"], outcome, logger)
 
     promotion = {
-        "promoted": promoted,
+        "promoted": winner is not None and update_applied,
         "update_applied": update_applied,
         "old_version": old_version,
         "new_version": new_version,
         "run_id": run_id,
-        "challenger": {
-            "weights": challenger_weights.tolist(),
-            "validation_cost": challenger_cost,
-            "validation_mean_u": candidate_validation["mean_u"],
-        },
+        "preference_candidate_available": preference_candidate is not None,
+        "winner": (
+            {
+                "kind": winner["kind"],
+                "candidate_id": winner["candidate_id"],
+                "weights": winner["weights"].tolist(),
+                "validation_cost": winner["validation_cost"],
+                "h2h_mean_u": winner["h2h"]["mean_u"] if winner["h2h"] else None,
+            }
+            if winner is not None else None
+        ),
+        "challengers": [
+            {
+                "kind": c["kind"],
+                "candidate_id": c["candidate_id"],
+                "weights": c["weights"].tolist(),
+                "validation_cost": c["validation_cost"],
+                "validation_mean_u": c["validation"]["mean_u"],
+                "gate_validation_passed": c["do_h2h"],
+                "gate_h2h_mean_u": c["h2h"]["mean_u"] if c["h2h"] else None,
+                "qualified": c["qualified"],
+            }
+            for c in challengers
+        ],
         "incumbent": {
             "weights": incumbent_weights.tolist(),
             "validation_cost": incumbent_cost,
             "validation_mean_u": incumbent_validation["mean_u"],
-        },
-        "gate_validation": {
-            "passed": do_h2h,
-            "evidence": (
-                f"challenger_cost={challenger_cost:.9f} < incumbent_cost={incumbent_cost:.9f}"
-                if do_h2h
-                else f"challenger_cost={challenger_cost:.9f} >= incumbent_cost={incumbent_cost:.9f}"
-            ),
-        },
-        "gate_h2h": {
-            "triggered": do_h2h,
-            "mean_u": h2h["mean_u"] if h2h else None,
-            "passed": promoted,
         },
         "submission_updated": update_applied,
         "reason_not_updated": reason,
@@ -514,7 +677,7 @@ def run_plan9_cycle(
     with open(os.path.join(run_dir, "promotion.json"), "w", encoding="utf-8") as f:
         json.dump(promotion, f, indent=2, ensure_ascii=False)
 
-    logger.log(f"[done] promotion={promoted} submission_updated={update_applied}")
+    logger.log(f"[done] promoted={promotion['promoted']} submission_updated={update_applied}")
     logger.log(f"[done] artifacts in {run_dir}")
     return promotion
 

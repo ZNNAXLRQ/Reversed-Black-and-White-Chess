@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -375,7 +376,7 @@ def determine_metadata(source_relative_path: str) -> Dict:
             "opponent_strength": "strong",
             "opponent_id": f"unknown:{source_relative_path}",
             "metadata_source": "user_confirmed",
-            "notes": "用户确认：我方黑/对方白；我方失败对局，对手视为强对手（身份未知，非同一对手）",
+            "notes": "用户确认：我方黑/对方白；对手视为强对手（身份未知，非同一对手）；数据选择仅纳入对手获胜（我方失败）的对局",
         }
     return {
         "self_color": "",
@@ -516,11 +517,23 @@ def scan_and_process(training_dir: Optional[str] = None, write_outputs: bool = T
                 "detail": str(exc),
             })
 
-    # 增量更新 manifest：
+    # 清理孤儿产物：源文件已不在当前 sources 中的 processed/<game_id> 目录与 manifest 行。
+    # 仅在 write_outputs=True 时执行删除；dry-run 只读不删（仍记录 removed_orphans 计数）。
+    current_paths = set(sources.keys())
+    existing_rows = load_manifest(manifest_path)
+    orphan_rows = [r for r in existing_rows if r.get("source_relative_path") not in current_paths]
+    removed_game_ids = [r.get("game_id") for r in orphan_rows if r.get("game_id")]
+    if write_outputs:
+        for gid in removed_game_ids:
+            gdir = os.path.join(processed_dir, str(gid))
+            if str(gid).startswith("game_") and os.path.isdir(gdir):
+                shutil.rmtree(gdir)
+
+    # 重写 manifest：只保留当前源文件对应的行（孤儿行删除），再增量新增/修正本次解析成功的行。
     # - 缺失行新增；
     # - 已存在行：仅当新元数据为 user_confirmed（权威用户确认）时才修正颜色/强度等字段，
     #   否则保留原行（不猜测玩家颜色和对手强度）。
-    existing_rows = load_manifest(manifest_path)
+    existing_rows = [r for r in existing_rows if r.get("source_relative_path") in current_paths]
     existing_by_path = {r["source_relative_path"]: r for r in existing_rows}
     for new_row in parsed_meta:
         rel = new_row["source_relative_path"]
@@ -538,6 +551,7 @@ def scan_and_process(training_dir: Optional[str] = None, write_outputs: bool = T
         "failed": sum(1 for r in results if r["status"] == "failed"),
         "duplicates": sum(1 for r in results if r["status"] == "duplicate"),
         "unannotated": sum(1 for r in parsed_meta if r["metadata_source"] == "unconfirmed"),
+        "removed_orphans": len(removed_game_ids),
     }
 
     parse_manifest = {
@@ -546,6 +560,7 @@ def scan_and_process(training_dir: Optional[str] = None, write_outputs: bool = T
         "training_dir": os.path.abspath(training_dir),
         "files": results,
         "counts": counts,
+        "removed_orphans": removed_game_ids,
     }
     if write_outputs:
         write_json(parse_manifest_path, parse_manifest)

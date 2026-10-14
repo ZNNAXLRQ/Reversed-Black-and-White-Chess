@@ -89,6 +89,7 @@ def _write_fixture(tmp, games):
             "terminal": True,
             "rule_validation_status": "ok",
             "parser_version": "1.0.0",
+            "winner": g.get("winner", opp_color),
         }
         with open(os.path.join(game_dir, "summary.json"), "w", encoding="utf-8") as f:
             json.dump(summary, f)
@@ -119,7 +120,7 @@ def _read_jsonl(path):
     return recs
 
 
-def _make_game(game_id, sha, seed, strength="strong", opp_color=1, opp_id=None):
+def _make_game(game_id, sha, seed, strength="strong", opp_color=1, opp_id=None, winner=None):
     return {
         "game_id": game_id,
         "sha": sha,
@@ -127,6 +128,7 @@ def _make_game(game_id, sha, seed, strength="strong", opp_color=1, opp_id=None):
         "opponent_strength": strength,
         "opponent_color": opp_color,
         "opponent_id": opp_id or ("unknown:" + game_id),
+        "winner": opp_color if winner is None else winner,
     }
 
 
@@ -273,4 +275,33 @@ def test_reproducible_dataset_id_and_split(tmp_path):
     assert r1["dataset_id"] == r2["dataset_id"]
     assert r1["split"] == r2["split"]
     assert r1["manifest"]["split"] == r2["manifest"]["split"]
+
+
+# ---------- 9. 只纳入「我方失败」（对手获胜）的对局 ----------
+
+def test_winning_games_excluded(tmp_path):
+    # 我方获胜（winner=-1=我方黑）的对局应被排除；我方失败（winner=1=对手白）应纳入
+    games = [
+        _make_game("g_loss", _make_sha("l1"), 1, opp_color=1, winner=1),
+        _make_game("g_win", _make_sha("w1"), 2, opp_color=1, winner=-1),
+    ]
+    _write_fixture(tmp_path, games)
+    result = build_dataset(str(tmp_path), write_outputs=True)
+    assert result["included_game_count"] == 1
+    pool = _read_jsonl(os.path.join(result["output_dir"], "preference_pool.jsonl"))
+    assert {s["game_id"] for s in pool} == {"g_loss"}
+    reasons = {e["game_id"]: e["reason"] for e in result["manifest"]["excluded_games"]}
+    assert reasons["g_win"] == "self_won_or_draw_excluded"
+
+
+def test_draw_excluded(tmp_path):
+    games = [
+        _make_game("g_loss", _make_sha("l1"), 1, opp_color=1, winner=1),
+        _make_game("g_draw", _make_sha("d1"), 2, opp_color=1, winner=0),
+    ]
+    _write_fixture(tmp_path, games)
+    result = build_dataset(str(tmp_path), write_outputs=True)
+    assert result["included_game_count"] == 1
+    reasons = {e["game_id"]: e["reason"] for e in result["manifest"]["excluded_games"]}
+    assert reasons["g_draw"] == "self_won_or_draw_excluded"
 
