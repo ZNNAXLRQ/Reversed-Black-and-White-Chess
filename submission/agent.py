@@ -1,8 +1,10 @@
+import math
+import time
+
 import numpy as np
 import numba
 
 # 游戏规则与基本下棋
-
 COLOR_BLACK = -1
 COLOR_WHITE = 1
 COLOR_NONE = 0
@@ -174,46 +176,136 @@ def terminal_utility(board, perspective):
         return -1000.0 + (opp - own)
     return 0.0
 
-# Negamax 搜索与 Alpha-Beta 剪枝
+# Negamax 搜索与 Alpha-Beta 剪枝（置换表 + 走法排序 + 迭代加深）
+EXACT = 0
+LOWER = 1
+UPPER = 2
 
-def _order_moves(moves):
-    return sorted(moves, key=lambda m: POSITION_TABLE[m[0], m[1]], reverse=True)
+_TIME_CHECK_MASK = 2047
 
-def _negamax(board, color, depth, alpha, beta, weights):
+
+class _SearchTimeout(Exception):
+    pass
+
+
+class _SearchContext(object):
+    __slots__ = ("weights", "tt", "history", "killers", "deadline", "nodes", "timed_out")
+
+    def __init__(self, weights, time_budget=None):
+        self.weights = weights
+        self.tt = {}
+        self.history = {}
+        self.killers = {}
+        self.deadline = (
+            time.perf_counter() + time_budget
+            if (time_budget is not None and time_budget > 0)
+            else None
+        )
+        self.nodes = 0
+        self.timed_out = False
+
+
+def _board_key(board):
+    return board.tobytes()
+
+
+def _check_time(ctx):
+    if ctx.deadline is not None and time.perf_counter() >= ctx.deadline:
+        ctx.timed_out = True
+        raise _SearchTimeout()
+
+
+def _order_moves(ctx, color, moves, depth):
+    killers = ctx.killers.get(depth)
+    scored = []
+    for move in moves:
+        r, c = move
+        score = POSITION_TABLE[r, c] * 0.01
+        score += ctx.history.get((color, move), 0.0)
+        if killers is not None and move in killers:
+            score += 1000.0
+        scored.append((score, move))
+    scored.sort(key=lambda item: -item[0])
+    return [m for _, m in scored]
+
+
+def _negamax(ctx, board, color, depth, alpha, beta):
+    ctx.nodes += 1
+    if (ctx.nodes & _TIME_CHECK_MASK) == 0:
+        _check_time(ctx)
+
+    key = (color, _board_key(board))
+    tt_move = None
+    entry = ctx.tt.get(key)
+    if entry is not None:
+        tt_depth, tt_flag, tt_val, tt_best = entry
+        if tt_depth >= depth:
+            if tt_flag == EXACT:
+                return tt_val
+            if tt_flag == LOWER and tt_val >= beta:
+                return tt_val
+            if tt_flag == UPPER and tt_val <= alpha:
+                return tt_val
+        tt_move = tt_best
+
     moves = legal_moves(board, color)
     if not moves:
         if has_legal_move(board, opponent(color)):
-            # pass：不消耗深度，切换行动方并翻转分数
-            return -_negamax(board, opponent(color), depth, -beta, -alpha, weights)
-        # 双方均无合法走法，终局
-        return terminal_utility(board, color)  
+            return -_negamax(ctx, board, opponent(color), depth, -beta, -alpha)
+        return terminal_utility(board, color)
     if depth <= 0:
-        return evaluate(board, color, weights)
+        return evaluate(board, color, ctx.weights)
 
-    best = -float("inf")
-    for move in _order_moves(moves):
+    if tt_move is not None and tt_move in moves:
+        ordered = [tt_move] + [m for m in moves if m != tt_move]
+    else:
+        ordered = _order_moves(ctx, color, moves, depth)
+
+    orig_alpha = alpha
+    best = -math.inf
+    best_move = None
+    for move in ordered:
         child = apply_move(board, color, move)
-        score = -_negamax(child, opponent(color), depth - 1, -beta, -alpha, weights)
+        score = -_negamax(ctx, child, opponent(color), depth - 1, -beta, -alpha)
         if score > best:
             best = score
+            best_move = move
         if best > alpha:
             alpha = best
         if alpha >= beta:
+            if depth in ctx.killers:
+                if ctx.killers[depth][0] != move:
+                    ctx.killers[depth] = [move, ctx.killers[depth][0]]
+            else:
+                ctx.killers[depth] = [move]
+            ctx.history[(color, move)] = ctx.history.get((color, move), 0.0) + depth * depth
             break
+
+    if best_move is None:
+        best_move = ordered[0]
+    if best <= orig_alpha:
+        flag = UPPER
+    elif best >= beta:
+        flag = LOWER
+    else:
+        flag = EXACT
+    ctx.tt[key] = (depth, flag, best, best_move)
     return best
 
-def best_move(board, color, depth, weights):
+
+def _best_move_with_context(ctx, board, color, depth):
     moves = legal_moves(board, color)
     if not moves:
         return None
 
     best = None
-    best_score = -float("inf")
-    alpha = -float("inf")
-    beta = float("inf")
-    for move in _order_moves(moves):
+    best_score = -math.inf
+    alpha = -math.inf
+    beta = math.inf
+    ordered = _order_moves(ctx, color, moves, depth)
+    for move in ordered:
         child = apply_move(board, color, move)
-        score = -_negamax(child, opponent(color), depth - 1, -beta, -alpha, weights)
+        score = -_negamax(ctx, child, opponent(color), depth - 1, -beta, -alpha)
         if score > best_score:
             best_score = score
             best = move
@@ -221,13 +313,34 @@ def best_move(board, color, depth, weights):
             alpha = score
     return best
 
-# AI 接口与权重参数
 
+def best_move(board, color, depth, weights):
+    ctx = _SearchContext(weights, time_budget=None)
+    return _best_move_with_context(ctx, board, color, depth)
+
+
+def best_move_iterative(board, color, max_depth, weights, time_budget=None):
+    moves = legal_moves(board, color)
+    if not moves:
+        return None
+
+    ctx = _SearchContext(weights, time_budget=time_budget)
+    best = moves[0]
+    try:
+        for d in range(1, max_depth + 1):
+            b = _best_move_with_context(ctx, board, color, d)
+            if b is not None:
+                best = b
+    except _SearchTimeout:
+        pass
+    return best
+
+# AI 接口与权重参数
 _SEARCH_DEPTH = 4
 
 # BEGIN AUTO-UPDATED FINAL WEIGHTS
 _FIXED_WEIGHTS = np.array(
-    [-3.0861110771421476, -10.0, -0.3857156832111528, -7.651743487832784, 0.48587137914320344],
+    [-7.564687797463808, 9.019126725871288, 0.26414041262129473, -5.71691508627605, 0.5947836619489912],
     dtype=np.float64,
 )
 # END AUTO-UPDATED FINAL WEIGHTS
@@ -255,8 +368,9 @@ class AI(object):
         for move in moves:
             self.candidate_list.append(move)
 
-        # 搜索选中的合法走法追加到最后，平台取最后一个元素作为决策。
-        chosen = best_move(chessboard, self.color, self.depth, self.weights)
+        # 迭代加深搜索选中的合法走法追加到最后，平台取最后一个元素作为决策。
+        budget = self.time_out if (self.time_out and self.time_out > 0) else None
+        chosen = best_move_iterative(chessboard, self.color, self.depth, self.weights, time_budget=budget)
         if chosen is None: 
             chosen = moves[0]
         self.candidate_list.append(chosen)

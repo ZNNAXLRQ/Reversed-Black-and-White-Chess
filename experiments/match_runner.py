@@ -125,13 +125,17 @@ class MatchRunner:
             seed=seed,
         )
 
-    def evaluate_candidate(self, weights, baseline_weights, greedy_seeds=(101, 202)) -> MatchSummary:
+    def evaluate_candidate(self, weights, baseline_weights, greedy_seeds=(101, 202),
+                           baseline_weight=1.0, greedy_weight=1.0) -> MatchSummary:
         """候选权重 vs 固定基准 AI + 反转贪心 AI 的固定 6 局训练评价。
 
         局序：候选黑 vs 基准白；候选白 vs 基准黑；
               候选黑 vs 贪心(101)；候选白 vs 贪心(101)；
               候选黑 vs 贪心(202)；候选白 vs 贪心(202)。
         u_g 以候选自身为视角：(opp_count - own_count) / 64。
+
+        baseline_weight / greedy_weight 仅作用于 mean_u 的加权平均（wins/draws/losses 仍按
+        每局 sign 计数）。self-play 目标用 baseline_weight=2、greedy_weight=1 实现「4 冠军 + 2 贪心」。
         """
         games = []
         u_values = []
@@ -165,7 +169,15 @@ class MatchRunner:
                 losses += 1
             else:
                 draws += 1
-        mean_u = float(np.mean(u_values))
+
+        n_baseline = 2
+        n_greedy = 2 * len(greedy_seeds)
+        numerator = (
+            baseline_weight * sum(u_values[:n_baseline])
+            + greedy_weight * sum(u_values[n_baseline:])
+        )
+        denominator = baseline_weight * n_baseline + greedy_weight * n_greedy
+        mean_u = float(numerator / denominator) if denominator > 0 else 0.0
         return MatchSummary(
             wins=wins, draws=draws, losses=losses,
             mean_u=mean_u, u_values=u_values, games=games,
@@ -194,5 +206,4 @@ class MatchRunner:
             games=[r1, r2], u_values=[u1, u2],
             mean_u=mean_u, challenger_wins=(mean_u > 0),
         )
-
 

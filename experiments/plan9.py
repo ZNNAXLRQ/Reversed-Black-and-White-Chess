@@ -255,10 +255,14 @@ def update_submission_weights(new_weights, logger: Logger) -> Dict:
     return {"updated": True, "old_sha256": old_sha, "new_sha256": new_sha, "backup_path": backup_path}
 
 
-def validate_weights(weights, runner: MatchRunner, greedy_seeds) -> Dict:
-    """6 局独立验证（固定基准 AI 两色各 1 局 + 反转贪心两种子各两色各 1 局）。"""
+def validate_weights(weights, runner: MatchRunner, greedy_seeds, opponent_weights=None) -> Dict:
+    """6 局独立验证（对手 AI 两色各 1 局 + 反转贪心两种子各两色各 1 局）。
+
+    opponent_weights 默认固定 baseline；self-play 模式传入现任冠军，使验证也测「赢冠军+贪心」。
+    """
     weights = np.asarray(weights, dtype=np.float64)
-    summary = runner.evaluate_candidate(weights, BASELINE_WEIGHTS, greedy_seeds=greedy_seeds)
+    opponent = BASELINE_WEIGHTS if opponent_weights is None else np.asarray(opponent_weights, dtype=np.float64)
+    summary = runner.evaluate_candidate(weights, opponent, greedy_seeds=greedy_seeds)
     cost = (1.0 - summary.mean_u) / 2.0
     return {
         "weights": weights.tolist(),
@@ -382,8 +386,13 @@ def run_plan9_cycle(
     training_seed: int,
     run_id: str,
     logger: Logger,
+    selfplay: bool = False,
 ) -> Dict:
-    """执行一个完整 Plan 9 周期，返回 promotion 报告。"""
+    """执行一个完整 Plan 9 周期，返回 promotion 报告。
+
+    selfplay=True 时，训练 objective 的固定陪练从 baseline 权重换成当前 incumbent
+    冠军权重（self-play 自我迭代训练目标），验证/H2H/晋级规则不变。
+    """
     validation_seed_1 = 601 + 2 * (cycle_index - 1)
     validation_seed_2 = 602 + 2 * (cycle_index - 1)
     validation_seeds = (validation_seed_1, validation_seed_2)
@@ -400,6 +409,18 @@ def run_plan9_cycle(
     backup_meta = backup_submission(logger, version)
     source_hashes = {p: sha256_file(os.path.join(_PROJECT_ROOT, p)) for p in _SOURCE_FILES}
 
+    # 训练 objective 配置（selfplay 4 冠军 + 2 贪心，match 2 baseline + 4 贪心）。
+    if selfplay:
+        training_greedy_seeds = (TRAINING_GREEDY_SEEDS[0],)
+        baseline_weight = 2.0
+        greedy_weight = 1.0
+        games_per_eval = 4
+    else:
+        training_greedy_seeds = TRAINING_GREEDY_SEEDS
+        baseline_weight = 1.0
+        greedy_weight = 1.0
+        games_per_eval = 6
+
     config = {
         "cycle_index": cycle_index,
         "run_id": run_id,
@@ -411,6 +432,8 @@ def run_plan9_cycle(
         "weight_bounds": [WEIGHT_LOWER, WEIGHT_UPPER],
         "decode": "w = -10 + 20*z, z in [0,1]^5",
         "objective_version": "cost=(1-mean_u)/2; u_g=(opp_count-own_count)/64 (candidate perspective)",
+        "objective_mode": "selfplay" if selfplay else "match",
+        "training_opponent_weights": incumbent_weights.tolist() if selfplay else BASELINE_LIST,
         "ncs_params": {
             "population_size": POPULATION_SIZE,
             "T_max": T_MAX,
@@ -419,8 +442,10 @@ def run_plan9_cycle(
             "epoch": EPOCH,
         },
         "candidate_evaluations": POPULATION_SIZE * (T_MAX + 1),
-        "objective_games": POPULATION_SIZE * (T_MAX + 1) * 6,
-        "training_greedy_seeds": list(TRAINING_GREEDY_SEEDS),
+        "objective_games": POPULATION_SIZE * (T_MAX + 1) * games_per_eval,
+        "training_greedy_seeds": list(training_greedy_seeds),
+        "baseline_weight": baseline_weight,
+        "greedy_weight": greedy_weight,
         "validation_greedy_seeds": list(validation_seeds),
         "h2h_seeds": list(h2h_seeds),
         "search_depth": DEPTH,
@@ -437,12 +462,21 @@ def run_plan9_cycle(
     )
     logger.log(f"[config] incumbent_weights={np.round(incumbent_weights, 6).tolist()}")
     logger.log(f"[config] baseline_weights={BASELINE_LIST}")
+    if selfplay:
+        logger.log(f"[config] selfplay opponent=incumbent weights={np.round(incumbent_weights, 6).tolist()}")
 
-    # Step 2：NCS 训练。
+    # Step 2：NCS 训练。self-play 模式用当前冠军做固定陪练（4 冠军 + 2 贪心），
+    # 否则用固定 baseline（2 baseline + 4 贪心）。
     space = ParameterSpace([0.0] * 5, [1.0] * 5)
-    objective = ReversiObjective(
-        BASELINE_WEIGHTS, depth=DEPTH, greedy_seeds=TRAINING_GREEDY_SEEDS
-    )
+    if selfplay:
+        objective = ReversiObjective(
+            incumbent_weights, depth=DEPTH, greedy_seeds=training_greedy_seeds,
+            baseline_weight=baseline_weight, greedy_weight=greedy_weight,
+        )
+    else:
+        objective = ReversiObjective(
+            BASELINE_WEIGHTS, depth=DEPTH, greedy_seeds=training_greedy_seeds,
+        )
     total_evals = POPULATION_SIZE * (T_MAX + 1)
     logging_objective = LoggingObjective(objective, total_evals, logger)
     optimizer = NCSOptimizer(
@@ -474,7 +508,7 @@ def run_plan9_cycle(
         "num_evaluations": result.num_evaluations,
         "num_iterations": result.num_iterations,
         "stop_reason": result.stop_reason,
-        "objective_games": result.num_evaluations * 6,
+        "objective_games": result.num_evaluations * games_per_eval,
         "elapsed_s": train_elapsed,
         "history": list(result.history),
         "sigma_mean_history": list(result.metrics.get("sigma_mean_history", [])),
@@ -522,7 +556,9 @@ def run_plan9_cycle(
     # Step 4：同一配置下独立实战验证（incumbent + 每个 challenger）。
     logger.log("[validation] challengers vs incumbent (same protocol) ...")
     runner = MatchRunner(depth=DEPTH)
-    incumbent_validation = validate_weights(incumbent_weights, runner, validation_seeds)
+    incumbent_validation = validate_weights(
+        incumbent_weights, runner, validation_seeds, opponent_weights=incumbent_weights
+    )
     incumbent_cost = incumbent_validation["cost"]
     with open(os.path.join(run_dir, "incumbent_validation.json"), "w", encoding="utf-8") as f:
         json.dump(incumbent_validation, f, indent=2, ensure_ascii=False)
@@ -533,7 +569,9 @@ def run_plan9_cycle(
     )
 
     for ch in challengers:
-        ch["validation"] = validate_weights(ch["weights"], runner, validation_seeds)
+        ch["validation"] = validate_weights(
+            ch["weights"], runner, validation_seeds, opponent_weights=incumbent_weights
+        )
         ch["validation_cost"] = ch["validation"]["cost"]
         label = ch["candidate_id"] or "match_ncs_candidate"
         logger.log(
@@ -687,11 +725,13 @@ def main() -> None:
     parser.add_argument("--cycle-index", type=int, default=1)
     parser.add_argument("--seed", type=int, default=45)
     parser.add_argument("--run-id", type=str, default=None)
+    parser.add_argument("--selfplay", action="store_true", help="self-play 训练目标（陪练=现任冠军）")
     args = parser.parse_args()
 
     cycle_index = args.cycle_index
     training_seed = args.seed
-    run_id = args.run_id or f"ncs_cycle_{cycle_index:03d}_seed_{training_seed}"
+    prefix = "selfplay_cycle" if args.selfplay else "ncs_cycle"
+    run_id = args.run_id or f"{prefix}_{cycle_index:03d}_seed_{training_seed}"
 
     os.makedirs(_TRAINING_RUNS_DIR, exist_ok=True)
     run_dir = os.path.join(_TRAINING_RUNS_DIR, run_id)
@@ -700,7 +740,7 @@ def main() -> None:
     os.makedirs(run_dir, exist_ok=True)
     logger = Logger(os.path.join(run_dir, "run.log"))
     try:
-        promotion = run_plan9_cycle(cycle_index, training_seed, run_id, logger)
+        promotion = run_plan9_cycle(cycle_index, training_seed, run_id, logger, selfplay=args.selfplay)
         logger.log("[summary] " + json.dumps(promotion, ensure_ascii=False))
     finally:
         logger.close()

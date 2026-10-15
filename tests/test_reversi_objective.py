@@ -85,3 +85,43 @@ def test_h2h_challenger_wins_flag():
     assert r.mean_u == pytest.approx(0.0)
     assert r.challenger_wins is False
 
+
+def test_evaluate_candidate_weighted_mean_u():
+    """self-play 加权目标：baseline_weight=2、greedy_weight=1 时 mean_u 按 4:2 加权。"""
+    runner = MatchRunner(depth=1)
+    weights = np.array([0.0, 0.0, 0.0, 0.0, 0.0])
+    summary = runner.evaluate_candidate(
+        weights, BASELINE, greedy_seeds=(101,), baseline_weight=2.0, greedy_weight=1.0
+    )
+    assert len(summary.games) == 4
+    assert summary.wins + summary.draws + summary.losses == 4
+    u = summary.u_values
+    expected = (2.0 * (u[0] + u[1]) + 1.0 * (u[2] + u[3])) / 6.0
+    assert summary.mean_u == pytest.approx(expected)
+
+
+def test_objective_weighted_selfplay_ratio():
+    """ReversiObjective 透传加权参数，cost = (1 - weighted_mean_u)/2。"""
+    obj = ReversiObjective(
+        BASELINE, depth=1, greedy_seeds=(101,), baseline_weight=2.0, greedy_weight=1.0
+    )
+    z = np.array([0.5] * 5)
+    result = obj(z)
+    m = result.metrics
+    assert len(m["per_game"]) == 4
+    u = [pg["u"] for pg in m["per_game"]]
+    expected_mean_u = (2.0 * (u[0] + u[1]) + 1.0 * (u[2] + u[3])) / 6.0
+    assert m["mean_u"] == pytest.approx(expected_mean_u)
+    assert result.cost == pytest.approx((1.0 - expected_mean_u) / 2.0)
+
+
+def test_validate_weights_opponent_param():
+    """A1：validate_weights 支持 opponent_weights；对手=候选自身时前两局互为镜像（u0 == -u1）。"""
+    from experiments.plan9 import validate_weights
+
+    runner = MatchRunner(depth=1)
+    weights = np.array([0.0, 0.0, 0.0, 0.0, 0.0])
+    r = validate_weights(weights, runner, (603, 604), opponent_weights=weights)
+    assert len(r["u_values"]) == 6
+    assert r["u_values"][0] == pytest.approx(-r["u_values"][1])
+    assert "cost" in r and "mean_u" in r

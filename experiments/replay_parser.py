@@ -31,12 +31,15 @@ from reversi.rules import apply_move, flips, is_terminal, legal_moves
 
 PARSER_VERSION = "1.0.0"
 
-# 命名约束（用户确认）：所有棋盘数据文件统一按 chess_log_n.txt 命名（n 为正整数），
-# 可选位于 raw/ 子目录下。
+# 命名约束（用户确认）：棋盘数据文件按文件名区分我方执子颜色——
+# - chess_log_n.txt：我方执黑（self_color=-1）、对方执白（opponent_color=1）；
+# - n.txt（无前缀纯数字）：我方执白（self_color=1）、对方执黑（opponent_color=-1）。
+# 二者 n 均为正整数，可选位于 raw/ 子目录下。
 _CHESS_LOG_RE = re.compile(r"^(?:raw/)?chess_log_\d+\.txt$")
+_WHITE_LOG_RE = re.compile(r"^(?:raw/)?\d+\.txt$")
 
-# 颜色约束（用户确认，适用于所有 chess_log_n 文件）：我方执黑（self_color=-1）、
-# 对方执白（opponent_color=1）。
+# 颜色约束（用户确认）：chess_log_n.txt 我方执黑（self_color=-1）/对方执白（opponent_color=1）；
+# n.txt（纯数字）我方执白（self_color=1）/对方执黑（opponent_color=-1）。
 # 对手强度约束（用户确认）：文件夹内棋谱均为“我方失败”的对局，对手均可视为强对手
 # （opponent_strength=strong）；对手不来自同一个强对手（身份未知，opponent_id=unknown:<path>）。
 
@@ -363,8 +366,8 @@ def determine_metadata(source_relative_path: str) -> Dict:
     """按用户确认的约束确定棋谱元数据。
 
     约束（已写入报告并持续遵守）：
-    - 所有棋盘数据文件按 chess_log_n.txt 命名；
-    - 所有棋盘中我方执黑（self_color=-1）、对方执白（opponent_color=1）；
+    - chess_log_n.txt：我方执黑（self_color=-1）、对方执白（opponent_color=1）；
+    - n.txt（无前缀纯数字）：我方执白（self_color=1）、对方执黑（opponent_color=-1）；
     - 文件夹内均为“我方失败”对局，对手均可视为强对手（opponent_strength=strong）；
     - 对手不来自同一个强对手（身份未知，opponent_id=unknown:<path>）。
     """
@@ -377,6 +380,15 @@ def determine_metadata(source_relative_path: str) -> Dict:
             "opponent_id": f"unknown:{source_relative_path}",
             "metadata_source": "user_confirmed",
             "notes": "用户确认：我方黑/对方白；对手视为强对手（身份未知，非同一对手）；数据选择仅纳入对手获胜（我方失败）的对局",
+        }
+    if _WHITE_LOG_RE.match(rel):
+        return {
+            "self_color": COLOR_WHITE,
+            "opponent_color": COLOR_BLACK,
+            "opponent_strength": "strong",
+            "opponent_id": f"unknown:{source_relative_path}",
+            "metadata_source": "user_confirmed",
+            "notes": "用户确认：我方白/对方黑；对手视为强对手（身份未知，非同一对手）；数据选择仅纳入对手获胜（我方失败）的对局",
         }
     return {
         "self_color": "",
@@ -591,4 +603,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

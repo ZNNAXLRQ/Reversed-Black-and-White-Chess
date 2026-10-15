@@ -10,12 +10,13 @@ go() 中绝不运行 NCS 或任何多局优化。
 import numpy as np
 
 from .rules import legal_moves
-from .search import best_move
+from .search import best_move_iterative
 
 # 固定基准权重（项目无既有基准权重，按 Plan 0 结论使用；仅用于对照，非最优值）。
 BASELINE_WEIGHTS = np.array([-1.0, 1.0, 1.0, 1.0, -1.0], dtype=np.float64)
 
-# 权重实验统一搜索深度（搜索深度不进入 NCS 权重向量）。
+# 迭代加深的绝对深度上限（实际深度由 time_out 时间预算动态决定，不会超过此值）。
+# 设为 4：与训练/验证/H2H 统一深度一致，保证每步 <5s、整局 <180s。
 SEARCH_DEPTH = 4
 
 
@@ -39,11 +40,11 @@ class AI(object):
         for move in moves:
             self.candidate_list.append(move)
 
-        # 搜索选中的走法放在最后一个元素
-        chosen = best_move(chessboard, self.color, self.depth, self.weights)
+        # 迭代加深搜索：在 time_out 预算内尽量搜深，选中的走法放在最后一个元素。
+        budget = self.time_out if (self.time_out and self.time_out > 0) else None
+        chosen = best_move_iterative(chessboard, self.color, self.depth, self.weights, time_budget=budget)
         if chosen is None:  # 防御性兜底，理论上 moves 非空时不会发生
             chosen = moves[0]
         self.candidate_list.append(chosen)
 
         return self.candidate_list
-

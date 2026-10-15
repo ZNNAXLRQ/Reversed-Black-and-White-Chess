@@ -17,7 +17,8 @@ DECODE_OFFSET = -10.0
 class ReversiObjective:
     """候选权重（归一化 z ∈ [0,1]^5）的固定训练目标。"""
 
-    def __init__(self, baseline_weights, depth=4, greedy_seeds=(101, 202)):
+    def __init__(self, baseline_weights, depth=4, greedy_seeds=(101, 202),
+                 baseline_weight=1.0, greedy_weight=1.0):
         self.baseline_weights = np.asarray(baseline_weights, dtype=np.float64)
         if self.baseline_weights.shape != (5,):
             raise ValueError(
@@ -25,6 +26,8 @@ class ReversiObjective:
             )
         self.depth = depth
         self.greedy_seeds = tuple(greedy_seeds)
+        self.baseline_weight = float(baseline_weight)
+        self.greedy_weight = float(greedy_weight)
         self.runner = MatchRunner(depth=depth)
         self._cache = {}
 
@@ -46,7 +49,8 @@ class ReversiObjective:
             return self._cache[key]
 
         summary = self.runner.evaluate_candidate(
-            weights, self.baseline_weights, greedy_seeds=self.greedy_seeds
+            weights, self.baseline_weights, greedy_seeds=self.greedy_seeds,
+            baseline_weight=self.baseline_weight, greedy_weight=self.greedy_weight,
         )
         cost = (1.0 - summary.mean_u) / 2.0
         metrics = {
@@ -63,4 +67,3 @@ class ReversiObjective:
         result = EvaluationResult(cost=cost, metrics=metrics)
         self._cache[key] = result
         return result
-

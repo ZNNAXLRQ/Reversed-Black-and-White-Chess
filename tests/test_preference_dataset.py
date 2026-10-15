@@ -224,7 +224,7 @@ def test_feature_order_length_finite(tmp_path):
     for s in pool:
         assert s["feature_names"] == FEATURE_NAMES
         for feat in s["action_features"]:
-            assert len(feat) == 5
+            assert len(feat) == len(FEATURE_NAMES)
             assert all(math.isfinite(x) for x in feat)
 
 

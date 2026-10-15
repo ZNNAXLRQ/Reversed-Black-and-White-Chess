@@ -166,6 +166,24 @@ def test_other_file_metadata_unknown():
     assert meta["opponent_id"] == "unknown:other_file.txt"
 
 
+def test_white_data_file_metadata():
+    # 白子数据 n.txt（无前缀纯数字）：我方白、对方黑、对手强
+    meta = determine_metadata("1.txt")
+    assert meta["self_color"] == COLOR_WHITE
+    assert meta["opponent_color"] == COLOR_BLACK
+    assert meta["opponent_strength"] == "strong"
+    assert meta["metadata_source"] == "user_confirmed"
+    assert meta["opponent_id"] == "unknown:1.txt"
+
+
+def test_white_data_raw_path_metadata():
+    # 白子数据也支持 raw/ 子目录
+    meta = determine_metadata("raw/2.txt")
+    assert meta["self_color"] == COLOR_WHITE
+    assert meta["opponent_color"] == COLOR_BLACK
+    assert meta["opponent_strength"] == "strong"
+
+
 def test_valid_metadata_passes():
     validate_metadata({
         "self_color": COLOR_BLACK, "opponent_color": COLOR_WHITE,
@@ -333,4 +351,3 @@ def test_scan_and_process_dry_run_does_not_remove(tmp_path):
     r = scan_and_process(training, write_outputs=False)  # dry-run 只读
     assert r["counts"]["removed_orphans"] == 1
     assert os.path.isdir(os.path.join(training, "processed", "game_chess_log_1"))
-
