@@ -10,7 +10,7 @@ import numpy as np
 from experiments.preference_dataset import (
     FEATURE_NAMES, build_dataset, build_samples_for_game,
 )
-from reversi.board import COLOR_BLACK, COLOR_WHITE, initial_board
+from reversi.board import COLOR_BLACK, COLOR_WHITE, initial_board_array
 from reversi.evaluator import features as eval_features
 from reversi.rules import apply_move as eval_apply, flips, is_terminal, legal_moves
 
@@ -22,7 +22,7 @@ MANIFEST_COLUMNS = [
 
 def _gen_game_moves(seed):
     """用真实规则生成一局随机对局，返回 Plan 10 moves.jsonl 格式的记录列表。"""
-    board = initial_board()
+    board = initial_board_array()
     side = COLOR_BLACK
     rng = np.random.default_rng(seed)
     moves = []
@@ -231,7 +231,7 @@ def test_feature_order_length_finite(tmp_path):
 # ---------- 6. 单合法走法样本被计数但不进入偏好损失样本 ----------
 
 def test_forced_move_counted_not_in_pool():
-    board = initial_board()
+    board = initial_board_array()
     moves = [
         {"is_pass": False, "side_to_move": 1, "legal_moves": [[2, 2]], "chosen_move": [2, 2],
          "board_before": board.tolist(), "ply": 1},

@@ -9,6 +9,7 @@ go() 中绝不运行 NCS 或任何多局优化。
 """
 import numpy as np
 
+from .board import board_from_array
 from .rules import legal_moves
 from .search import best_move_iterative
 
@@ -32,7 +33,9 @@ class AI(object):
     def go(self, chessboard):
         self.candidate_list.clear()
 
-        moves = legal_moves(chessboard, self.color)
+        # 平台传入的 chessboard 是 numpy 8x8 int8 数组；内部转换为位棋盘。
+        bb = board_from_array(chessboard)
+        moves = legal_moves(bb, self.color)
         if not moves:
             return []
 
@@ -42,7 +45,7 @@ class AI(object):
 
         # 迭代加深搜索：在 time_out 预算内尽量搜深，选中的走法放在最后一个元素。
         budget = self.time_out if (self.time_out and self.time_out > 0) else None
-        chosen = best_move_iterative(chessboard, self.color, self.depth, self.weights, time_budget=budget)
+        chosen = best_move_iterative(bb, self.color, self.depth, self.weights, time_budget=budget)
         if chosen is None:  # 防御性兜底，理论上 moves 非空时不会发生
             chosen = moves[0]
         self.candidate_list.append(chosen)

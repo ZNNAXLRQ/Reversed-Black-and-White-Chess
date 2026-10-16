@@ -6,7 +6,7 @@
 全部测试在临时目录进行（monkeypatch 覆盖 _SUBMISSION_PATH / _SUBMISSION_VERSIONS_DIR），
 绝不动正式 submission/agent.py。
 """
-import os
+import codecs
 
 import numpy as np
 import pytest
@@ -144,3 +144,70 @@ def test_writeback_verify_failure_restores(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         mod.update_submission_weights(NEW_WEIGHTS, _FakeLogger())
     assert agent_path.read_text(encoding="utf-8") == old_content
+
+
+@pytest.mark.parametrize("bom", [b"", codecs.BOM_UTF8], ids=["utf8", "utf8-bom"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_writeback_preserves_source_bytes(tmp_path, monkeypatch, bom, newline):
+    mod, agent_path, versions_dir = _setup(tmp_path, monkeypatch, "")
+    source = ("# 中文前缀\n" + _template(OLD_WEIGHTS) + "# 中文后缀\n").replace("\n", newline)
+    # Include a different newline outside the block, to detect normalization.
+    original = bom + source.encode("utf-8") + b"# mixed newline\n"
+    agent_path.write_bytes(original)
+    info = mod.update_submission_weights(NEW_WEIGHTS, _FakeLogger())
+    written = agent_path.read_bytes()
+    begin, end = BEGIN.encode(), END.encode()
+    assert info["updated"] is True
+    assert written[:written.index(begin)] == original[:original.index(begin)]
+    assert written[written.index(end):] == original[original.index(end):]
+    assert written.startswith(codecs.BOM_UTF8) == bool(bom)
+    assert np.array_equal(mod.load_submission_weights(str(agent_path)), NEW_WEIGHTS)
+    compile(written, str(agent_path), "exec")
+    backups = list(versions_dir.glob("agent_pre_writeback_*.py"))
+    assert len(backups) == 1 and backups[0].read_bytes() == original
+
+
+def test_writeback_bom_verify_failure_restores_exact_bytes(tmp_path, monkeypatch):
+    mod, agent_path, _ = _setup(tmp_path, monkeypatch, "")
+    original = codecs.BOM_UTF8 + _template(OLD_WEIGHTS).replace("\n", "\r\n").encode("utf-8")
+    agent_path.write_bytes(original)
+    # Even a numerically close but incorrect deployment must be rejected.
+    wrong = np.asarray(NEW_WEIGHTS) + 1e-9
+    monkeypatch.setattr(mod, "load_submission_weights", lambda path: wrong)
+    with pytest.raises(RuntimeError, match="written weights"):
+        mod.update_submission_weights(NEW_WEIGHTS, _FakeLogger())
+    assert agent_path.read_bytes() == original
+
+
+@pytest.mark.parametrize("invalid_suffix", ["return 1\n", "x = \ufeff1\n"])
+def test_writeback_invalid_source_never_replaced(tmp_path, monkeypatch, invalid_suffix):
+    mod, agent_path, _ = _setup(tmp_path, monkeypatch, "")
+    original = codecs.BOM_UTF8 + (_template(OLD_WEIGHTS) + invalid_suffix).encode("utf-8")
+    agent_path.write_bytes(original)
+    with pytest.raises(RuntimeError, match="does not compile"):
+        mod.update_submission_weights(NEW_WEIGHTS, _FakeLogger())
+    assert agent_path.read_bytes() == original
+    assert not agent_path.with_suffix(".py.tmp").exists()
+
+
+def test_writeback_reuses_identical_backup_without_overwrite(tmp_path, monkeypatch):
+    mod, agent_path, versions_dir = _setup(tmp_path, monkeypatch, _template(OLD_WEIGHTS))
+    original = agent_path.read_bytes()
+    versions_dir.mkdir()
+    backup = versions_dir / f"agent_pre_writeback_{mod.sha256_file(str(agent_path))[:12]}.py"
+    backup.write_bytes(original)
+    stamp = backup.stat().st_mtime_ns
+    mod.update_submission_weights(NEW_WEIGHTS, _FakeLogger())
+    assert backup.read_bytes() == original and backup.stat().st_mtime_ns == stamp
+
+
+def test_writeback_conflicting_backup_rejected(tmp_path, monkeypatch):
+    mod, agent_path, versions_dir = _setup(tmp_path, monkeypatch, _template(OLD_WEIGHTS))
+    original = agent_path.read_bytes()
+    versions_dir.mkdir()
+    backup = versions_dir / f"agent_pre_writeback_{mod.sha256_file(str(agent_path))[:12]}.py"
+    backup.write_bytes(b"historical backup must not be overwritten")
+    with pytest.raises(RuntimeError, match="backup"):
+        mod.update_submission_weights(NEW_WEIGHTS, _FakeLogger())
+    assert agent_path.read_bytes() == original
+    assert backup.read_bytes() == b"historical backup must not be overwritten"

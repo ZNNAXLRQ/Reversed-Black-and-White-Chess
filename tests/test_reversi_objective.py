@@ -115,13 +115,24 @@ def test_objective_weighted_selfplay_ratio():
     assert result.cost == pytest.approx((1.0 - expected_mean_u) / 2.0)
 
 
-def test_validate_weights_opponent_param():
-    """A1：validate_weights 支持 opponent_weights；对手=候选自身时前两局互为镜像（u0 == -u1）。"""
-    from experiments.plan9 import validate_weights
+def test_validate_weights_24_game_protocol(monkeypatch):
+    """24 局验证协议：validate_weights 聚合 24 局 u 值与 8 局自对弈 u 值。"""
+    from experiments import plan9
+    from experiments.match_runner import GameResult, ValidationResult
 
     runner = MatchRunner(depth=1)
     weights = np.array([0.0, 0.0, 0.0, 0.0, 0.0])
-    r = validate_weights(weights, runner, (603, 604), opponent_weights=weights)
-    assert len(r["u_values"]) == 6
-    assert r["u_values"][0] == pytest.approx(-r["u_values"][1])
+    opponent_weights = [np.array([1.0, 0.0, 0.0, 0.0, 0.0])] * 3
+
+    u_values = [0.5, -0.5, 0.5, -0.5, -0.5, 0.5, -0.5, 0.5] + [0.25] * 16
+    self_play_u = [0.5, -0.5, 0.5, -0.5, -0.5, 0.5, -0.5, 0.5]
+    games = [GameResult(black_count=1, white_count=2, steps=1, elapsed=0.0) for _ in range(24)]
+    fake = ValidationResult(games=games, u_values=u_values, self_play_u_values=self_play_u)
+    monkeypatch.setattr(runner, "validate_protocol", lambda *a, **k: fake)
+
+    r = plan9.validate_weights(weights, runner, weights, opponent_weights, greedy_seed=999)
+    assert len(r["u_values"]) == 24
+    assert len(r["self_play_u_values"]) == 8
+    assert r["self_play_mean_u"] == pytest.approx(np.mean(self_play_u))
     assert "cost" in r and "mean_u" in r
+    assert r["cost"] == pytest.approx((1.0 - r["mean_u"]) / 2.0)

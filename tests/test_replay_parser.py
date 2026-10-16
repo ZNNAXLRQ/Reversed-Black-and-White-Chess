@@ -2,6 +2,8 @@
 import hashlib
 import json
 import os
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -12,7 +14,7 @@ from experiments.replay_parser import (
     discover_source_files, load_manifest, parse_snapshots, process_file,
     reconstruct_game, scan_and_process, validate_metadata,
 )
-from reversi.board import COLOR_BLACK, COLOR_WHITE, count, initial_board, opponent
+from reversi.board import COLOR_BLACK, COLOR_WHITE, count, initial_board_array, opponent
 from reversi.rules import apply_move, flips, is_terminal, legal_moves
 
 
@@ -36,7 +38,7 @@ def _synthetic_game(seed=12345):
     snapshots[i] 为第 i 手落子后的棋盘；moves[i] 为对应的 (row, col)。
     该对局完全由项目规则生成，不依赖任何磁盘上的棋谱文件。
     """
-    board = initial_board()
+    board = initial_board_array()
     side = COLOR_BLACK
     snaps = []
     moves = []
@@ -71,7 +73,7 @@ def test_parse_snapshots_valid():
 def test_first_move_recovered_uniquely():
     # 首手必须由标准初始棋盘唯一恢复，不硬编码坐标
     snaps, moves = _synthetic_game()
-    board = initial_board()
+    board = initial_board_array()
     matches = [m for m in legal_moves(board, COLOR_BLACK)
                if np.array_equal(apply_move(board, COLOR_BLACK, m), snaps[0])]
     assert len(matches) == 1
@@ -300,20 +302,94 @@ def test_input_hash_unchanged_and_outputs_reparseable(tmp_path):
 def test_scan_excludes_generated_dirs(tmp_path):
     training = str(tmp_path)
     os.makedirs(os.path.join(training, "raw"))
-    os.makedirs(os.path.join(training, "processed"))
-    os.makedirs(os.path.join(training, "datasets"))
-    for rel in ("a.txt", "game_manifest.csv"):
-        with open(os.path.join(training, rel), "w", encoding="utf-8") as f:
-            f.write("[]")
-    with open(os.path.join(training, "raw", "b.txt"), "w", encoding="utf-8") as f:
-        f.write("[]")
-    with open(os.path.join(training, "processed", "c.txt"), "w", encoding="utf-8") as f:
-        f.write("[]")
-    with open(os.path.join(training, "datasets", "d.txt"), "w", encoding="utf-8") as f:
-        f.write("[]")
+    for rel in ("chess_log_1.txt", "2.txt", "raw/chess_log_3.txt", "raw/4.txt"):
+        (tmp_path / rel).write_text("[]", encoding="utf-8")
+    for dirname in ("processed", "datasets", "preference_runs", "candidates", "other", "raw/nested"):
+        folder = tmp_path / dirname
+        folder.mkdir(parents=True)
+        (folder / "chess_log_5.txt").write_text("[]", encoding="utf-8")
 
     sources = discover_source_files(training)
-    assert set(sources.keys()) == {"a.txt", "raw/b.txt"}
+    expected = {"chess_log_1.txt", "2.txt", "raw/chess_log_3.txt", "raw/4.txt"}
+    assert set(sources) == expected
+    assert sources == {rel: str(tmp_path / rel) for rel in expected}
+
+
+@pytest.mark.parametrize("subdir", ["", "raw"])
+def test_scan_ignores_control_files_and_unrecognized_names(tmp_path, subdir):
+    folder = tmp_path / subdir
+    folder.mkdir(exist_ok=True)
+    ignored = (
+        "champion_pool.json", "game_manifest.csv", "parse_manifest.json", "notes.txt",
+        "chess_log_x.txt", "chess_log_1.txt.bak", "1.json", "1.txt.tmp",
+    )
+    for name in ignored:
+        (folder / name).write_text('{"champions": []}', encoding="utf-8")
+    (folder / "chess_log_1.txt").write_text("[]", encoding="utf-8")
+    prefix = "raw/" if subdir else ""
+
+    assert discover_source_files(str(tmp_path)) == {
+        prefix + "chess_log_1.txt": str(folder / "chess_log_1.txt"),
+    }
+
+
+def test_scan_and_process_preserves_champion_pool_and_reports_bad_replays(tmp_path):
+    snaps, _ = _synthetic_game()
+    (tmp_path / "chess_log_1.txt").write_text(
+        json.dumps([s.tolist() for s in snaps]), encoding="utf-8",
+    )
+    (tmp_path / "2.txt").write_text('{"not": "a replay"}', encoding="utf-8")
+    pool = tmp_path / "champion_pool.json"
+    pool.write_text('{"champions": []}', encoding="utf-8")
+    pool_before = pool.read_bytes()
+
+    result = scan_and_process(str(tmp_path))
+
+    assert result["counts"] == {
+        "scanned": 2, "parsed": 1, "failed": 1, "duplicates": 0,
+        "unannotated": 0, "removed_orphans": 0,
+    }
+    failures = [f for f in result["files"] if f["status"] == "failed"]
+    assert len(failures) == 1
+    assert failures[0]["source_relative_path"] == "2.txt"
+    assert failures[0]["reason"] == "unsupported_format"
+    assert pool.read_bytes() == pool_before
+    manifest = json.loads((tmp_path / "processed" / "parse_manifest.json").read_text(encoding="utf-8"))
+    assert manifest == result["parse_manifest"]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("invalid", [False, True])
+def test_cli_exit_code_matches_parse_failures(tmp_path, dry_run, invalid):
+    if invalid:
+        content = '{"not": "a replay"}'
+    else:
+        snaps, _ = _synthetic_game()
+        content = json.dumps([s.tolist() for s in snaps])
+    (tmp_path / "1.txt").write_text(content, encoding="utf-8")
+    pool = tmp_path / "champion_pool.json"
+    pool.write_text('{"champions": []}', encoding="utf-8")
+    pool_before = pool.read_bytes()
+    command = [sys.executable, "-X", "utf8", "-m", "experiments.replay_parser", "--training-dir", str(tmp_path)]
+    if dry_run:
+        command.append("--dry-run")
+
+    result = subprocess.run(
+        command, cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        capture_output=True, encoding="utf-8", timeout=30,
+    )
+
+    assert result.returncode == (1 if invalid else 0), result.stdout + result.stderr
+    assert f"scanned=1 parsed={int(not invalid)} failed={int(invalid)} duplicates=0" in result.stdout
+    assert "champion_pool.json" not in result.stdout
+    assert result.stderr == ""
+    assert pool.read_bytes() == pool_before
+    if dry_run:
+        assert not (tmp_path / "processed").exists()
+        assert not (tmp_path / "game_manifest.csv").exists()
+    else:
+        manifest = json.loads((tmp_path / "processed" / "parse_manifest.json").read_text(encoding="utf-8"))
+        assert manifest["counts"]["failed"] == int(invalid)
 
 
 # ---------- 孤儿产物清理：源文件已删除时自动清理 ----------

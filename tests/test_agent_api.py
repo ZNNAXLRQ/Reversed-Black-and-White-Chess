@@ -2,7 +2,10 @@
 import numpy as np
 
 from reversi.agent import AI
-from reversi.board import COLOR_BLACK, COLOR_NONE, COLOR_WHITE, initial_board
+from reversi.board import (
+    COLOR_BLACK, COLOR_NONE, COLOR_WHITE, board_from_array, board_to_array,
+    initial_board, initial_board_array,
+)
 from reversi.rules import apply_move, is_terminal, legal_moves
 
 
@@ -16,9 +19,9 @@ def test_signature_and_init():
 
 def test_candidate_list_all_legal_moves_and_chosen_last():
     ai = AI(8, COLOR_BLACK, 5.0)
-    board = initial_board()
-    result = ai.go(board)
-    moves = legal_moves(board, COLOR_BLACK)
+    arr = initial_board_array()
+    result = ai.go(arr)
+    moves = legal_moves(board_from_array(arr), COLOR_BLACK)
     assert result == ai.candidate_list
     assert len(result) == len(moves) + 1
     assert set(result[:-1]) == set(moves)
@@ -37,9 +40,9 @@ def test_no_legal_move_returns_empty():
 
 def test_full_game_smoke():
     # 两个 AI 交替下到终局，验证每步合法且能完成完整对局。
-    # 冒烟只验证对局闭环与接口协作，故使用浅深度 1 以控制测试时长。
-    black_ai = AI(8, COLOR_BLACK, 5.0)
-    white_ai = AI(8, COLOR_WHITE, 5.0)
+    # 冒烟只验证对局闭环与接口协作，故使用浅深度 1 与较小 time_out 以控制测试时长。
+    black_ai = AI(8, COLOR_BLACK, 0.1)
+    white_ai = AI(8, COLOR_WHITE, 0.1)
     black_ai.depth = 1
     white_ai.depth = 1
     board = initial_board()
@@ -49,7 +52,7 @@ def test_full_game_smoke():
         ai = black_ai if color == COLOR_BLACK else white_ai
         moves = legal_moves(board, color)
         if moves:
-            cand = ai.go(board)
+            cand = ai.go(board_to_array(board))
             assert cand, "有合法走法时不应返回空列表"
             chosen = cand[-1]
             assert chosen in moves
@@ -57,4 +60,3 @@ def test_full_game_smoke():
         color = -color
         steps += 1
     assert is_terminal(board)
-

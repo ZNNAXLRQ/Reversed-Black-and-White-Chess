@@ -53,15 +53,32 @@ class H2HResult:
     challenger_wins: bool
 
 
-class WeightedAgent:
-    """权重 AI：使用给定权重与搜索深度（确定性走法顺序）。"""
+@dataclass
+class ValidationResult:
+    """24 局验证协议结果（挑战者视角）。
 
-    def __init__(self, weights, depth=4):
+    self_play_u_values 为 8 局自对弈（vs 现任冠军）的 u 值，用于晋级门槛。
+    """
+
+    games: List[GameResult]
+    u_values: List[float]
+    self_play_u_values: List[float]
+
+
+class WeightedAgent:
+    """权重 AI：使用给定权重与搜索深度（确定性走法顺序）。
+
+    node_limit 用于终局精确搜索（empty <= 阈值）的确定性节点数上限回退；
+    非终局深度浅、不受影响，语义不变。
+    """
+
+    def __init__(self, weights, depth=4, node_limit=5000):
         self.weights = np.asarray(weights, dtype=np.float64)
         self.depth = depth
+        self.node_limit = node_limit
 
     def select_move(self, board, color, moves, seed=None):
-        return best_move(board, color, self.depth, self.weights)
+        return best_move(board, color, self.depth, self.weights, node_limit=self.node_limit)
 
 
 class GreedyAgent:
@@ -86,8 +103,9 @@ class GreedyAgent:
 class MatchRunner:
     """对局运行器：play_game / evaluate_candidate / head_to_head。"""
 
-    def __init__(self, depth=4):
+    def __init__(self, depth=4, node_limit=5000):
         self.depth = depth
+        self.node_limit = node_limit
 
     def play_game(self, black_agent, white_agent, seed=None) -> GameResult:
         board = initial_board()
@@ -141,23 +159,29 @@ class MatchRunner:
         u_values = []
 
         r = self.play_game(
-            WeightedAgent(weights, self.depth), WeightedAgent(baseline_weights, self.depth)
+            WeightedAgent(weights, self.depth, self.node_limit),
+            WeightedAgent(baseline_weights, self.depth, self.node_limit),
         )
         games.append(r)
         u_values.append((r.white_count - r.black_count) / 64.0)  # 候选黑
 
         r = self.play_game(
-            WeightedAgent(baseline_weights, self.depth), WeightedAgent(weights, self.depth)
+            WeightedAgent(baseline_weights, self.depth, self.node_limit),
+            WeightedAgent(weights, self.depth, self.node_limit),
         )
         games.append(r)
         u_values.append((r.black_count - r.white_count) / 64.0)  # 候选白
 
         for gs in greedy_seeds:
-            r = self.play_game(WeightedAgent(weights, self.depth), GreedyAgent(), seed=gs)
+            r = self.play_game(
+                WeightedAgent(weights, self.depth, self.node_limit), GreedyAgent(), seed=gs
+            )
             games.append(r)
             u_values.append((r.white_count - r.black_count) / 64.0)  # 候选黑
 
-            r = self.play_game(GreedyAgent(), WeightedAgent(weights, self.depth), seed=gs)
+            r = self.play_game(
+                GreedyAgent(), WeightedAgent(weights, self.depth, self.node_limit), seed=gs
+            )
             games.append(r)
             u_values.append((r.black_count - r.white_count) / 64.0)  # 候选白
 
@@ -190,14 +214,14 @@ class MatchRunner:
         仅 mean_u > 0 判挑战者胜。
         """
         r1 = self.play_game(
-            WeightedAgent(challenger_weights, self.depth),
-            WeightedAgent(incumbent_weights, self.depth),
+            WeightedAgent(challenger_weights, self.depth, self.node_limit),
+            WeightedAgent(incumbent_weights, self.depth, self.node_limit),
             seed=seeds[0],
         )
         u1 = (r1.white_count - r1.black_count) / 64.0  # 挑战者黑，incumbent 白
         r2 = self.play_game(
-            WeightedAgent(incumbent_weights, self.depth),
-            WeightedAgent(challenger_weights, self.depth),
+            WeightedAgent(incumbent_weights, self.depth, self.node_limit),
+            WeightedAgent(challenger_weights, self.depth, self.node_limit),
             seed=seeds[1],
         )
         u2 = (r2.black_count - r2.white_count) / 64.0  # 挑战者白，incumbent 黑
@@ -206,4 +230,61 @@ class MatchRunner:
             games=[r1, r2], u_values=[u1, u2],
             mean_u=mean_u, challenger_wins=(mean_u > 0),
         )
+
+    def _run_balanced(self, weights, opponent_factory, n_white, n_black, seed=None):
+        """候选权重 vs 单个固定对手，颜色平衡对局（先 n_white 局白，再 n_black 局黑）。
+
+        u = (opp_count - own_count) / 64，候选自身视角。
+        返回 (games, u_values)。
+        """
+        games = []
+        u_values = []
+        for _ in range(n_white):
+            r = self.play_game(
+                opponent_factory(), WeightedAgent(weights, self.depth, self.node_limit), seed=seed
+            )
+            games.append(r)
+            u_values.append((r.black_count - r.white_count) / 64.0)
+        for _ in range(n_black):
+            r = self.play_game(
+                WeightedAgent(weights, self.depth, self.node_limit), opponent_factory(), seed=seed
+            )
+            games.append(r)
+            u_values.append((r.white_count - r.black_count) / 64.0)
+        return games, u_values
+
+    def validate_protocol(self, challenger_weights, incumbent_weights, opponent_weights_list,
+                          greedy_seed=999) -> ValidationResult:
+        """24 局验证协议（颜色平衡）。
+
+        - 8 局自对弈：挑战者 vs 现任冠军（4 白 + 4 黑）；
+        - 16 局固定池：每个固定对手（历史冠军前 3）各 4 局（2 白 + 2 黑），
+          再加反转贪心（greedy_seed）4 局（2 白 + 2 黑）。
+
+        u = (opp_count - own_count) / 64（挑战者视角）。
+        """
+        games, u_values, self_play_u = [], [], []
+        g, u = self._run_balanced(
+            challenger_weights,
+            lambda: WeightedAgent(incumbent_weights, self.depth, self.node_limit),
+            4, 4,
+        )
+        games.extend(g)
+        u_values.extend(u)
+        self_play_u.extend(u)
+
+        for opp_w in opponent_weights_list:
+            g, u = self._run_balanced(
+                challenger_weights,
+                lambda: WeightedAgent(np.asarray(opp_w, dtype=np.float64), self.depth, self.node_limit),
+                2, 2,
+            )
+            games.extend(g)
+            u_values.extend(u)
+
+        g, u = self._run_balanced(challenger_weights, GreedyAgent, 2, 2, seed=greedy_seed)
+        games.extend(g)
+        u_values.extend(u)
+
+        return ValidationResult(games=games, u_values=u_values, self_play_u_values=self_play_u)
 

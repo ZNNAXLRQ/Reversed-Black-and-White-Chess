@@ -20,7 +20,7 @@ import importlib.util
 import json
 import os
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -39,6 +39,7 @@ _SUBMISSION_VERSIONS_DIR = os.path.join(_ARTIFACTS_DIR, "submission_versions")
 _SUBMISSION_PATH = os.path.join(_PROJECT_ROOT, "submission", "agent.py")
 _CANDIDATES_DIR = os.path.join(_PROJECT_ROOT, "training", "candidates")
 _CANDIDATE_REGISTRY_PATH = os.path.join(_CANDIDATES_DIR, "candidate_registry.json")
+_CHAMPION_POOL_PATH = os.path.join(_PROJECT_ROOT, "training", "champion_pool.json")
 
 FEATURE_NAMES = ["disc_diff", "position_diff", "mobility_diff", "corner_diff", "frontier_diff"]
 WEIGHT_LOWER = -10.0
@@ -54,6 +55,8 @@ EPOCH = 10
 # 搜索深度与对局种子（自本任务起统一为 4，与正式 Agent _SEARCH_DEPTH 一致）
 DEPTH = 4
 TRAINING_GREEDY_SEEDS = (101, 202)
+# 验证协议中固定池的反转贪心对手种子（方向二：固定 seed 999）。
+POOL_GREEDY_SEED = 999
 
 BASELINE_LIST = [float(x) for x in BASELINE_WEIGHTS]
 
@@ -182,8 +185,10 @@ def update_submission_weights(new_weights, logger: Logger) -> Dict:
     if np.any(w < WEIGHT_LOWER) or np.any(w > WEIGHT_UPPER):
         raise RuntimeError(f"weights must be within [{WEIGHT_LOWER}, {WEIGHT_UPPER}]")
 
-    with open(_SUBMISSION_PATH, "r", encoding="utf-8") as f:
-        content = f.read()
+    # 保留 BOM 和所有原始换行；只有权重标记块允许变化。
+    with open(_SUBMISSION_PATH, "rb") as f:
+        original_bytes = f.read()
+    content = original_bytes.decode("utf-8")
 
     if content.count(begin) != 1 or content.count(end) != 1:
         raise RuntimeError(
@@ -200,8 +205,13 @@ def update_submission_weights(new_weights, logger: Logger) -> Dict:
     backup_path = os.path.join(
         _SUBMISSION_VERSIONS_DIR, f"agent_pre_writeback_{old_sha[:12]}.py"
     )
-    with open(_SUBMISSION_PATH, "rb") as src, open(backup_path, "wb") as dst:
-        dst.write(src.read())
+    if os.path.exists(backup_path):
+        with open(backup_path, "rb") as src:
+            if src.read() != original_bytes:
+                raise RuntimeError(f"existing backup does not match submission: {backup_path}")
+    else:
+        with open(backup_path, "xb") as dst:
+            dst.write(original_bytes)
 
     end_idx = e_idx + len(end)
     before = content[:b_idx]
@@ -215,16 +225,21 @@ def update_submission_weights(new_weights, logger: Logger) -> Dict:
         ")\n"
         + end
     )
+    newline = "\r\n" if content[b_idx + len(begin):].startswith("\r\n") else "\n"
+    new_block = new_block.replace("\n", newline)
     new_content = before + new_block + after
+    new_bytes = new_content.encode("utf-8")
 
     try:
-        ast.parse(new_content)
+        # Python 的 bytes 源码编译会正确识别 UTF-8 BOM；不要剥离部署文件的 BOM。
+        ast.parse(new_bytes)
+        compile(new_bytes, _SUBMISSION_PATH, "exec")
     except SyntaxError as exc:
         raise RuntimeError(f"new submission content does not compile: {exc}") from exc
 
     tmp_path = _SUBMISSION_PATH + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(new_content)
+    with open(tmp_path, "xb") as f:
+        f.write(new_bytes)
 
     try:
         os.replace(tmp_path, _SUBMISSION_PATH)
@@ -234,16 +249,20 @@ def update_submission_weights(new_weights, logger: Logger) -> Dict:
         raise
 
     try:
-        with open(_SUBMISSION_PATH, "r", encoding="utf-8") as f:
-            written = f.read()
+        with open(_SUBMISSION_PATH, "rb") as f:
+            written_bytes = f.read()
+        written = written_bytes.decode("utf-8")
         if written.count(begin) != 1 or written.count(end) != 1:
             raise RuntimeError("marker block not unique after writeback")
         wb = written.index(begin)
         we = written.index(end) + len(end)
         if written[:wb] != before or written[we:] != after:
             raise RuntimeError("content outside marker block changed")
+        if written_bytes != new_bytes:
+            raise RuntimeError("written submission bytes differ from expected content")
+        compile(written_bytes, _SUBMISSION_PATH, "exec")
         loaded = load_submission_weights(_SUBMISSION_PATH)
-        if not np.allclose(loaded, w):
+        if not np.array_equal(loaded, w):
             raise RuntimeError(f"written weights {loaded.tolist()} != expected {w.tolist()}")
     except Exception:
         with open(backup_path, "rb") as src, open(_SUBMISSION_PATH, "wb") as dst:
@@ -255,23 +274,34 @@ def update_submission_weights(new_weights, logger: Logger) -> Dict:
     return {"updated": True, "old_sha256": old_sha, "new_sha256": new_sha, "backup_path": backup_path}
 
 
-def validate_weights(weights, runner: MatchRunner, greedy_seeds, opponent_weights=None) -> Dict:
-    """6 局独立验证（对手 AI 两色各 1 局 + 反转贪心两种子各两色各 1 局）。
+def validate_weights(weights, runner: MatchRunner, incumbent_weights,
+                     opponent_weights_list, greedy_seed=POOL_GREEDY_SEED) -> Dict:
+    """24 局验证协议（方向一）：8 局自对弈（vs 现任冠军）+ 16 局固定池（3 冠军 + 反转贪心）。
 
-    opponent_weights 默认固定 baseline；self-play 模式传入现任冠军，使验证也测「赢冠军+贪心」。
+    mean_u = 24 局 u 平均；cost = (1 - mean_u)/2。
+    self_play_mean_u = 8 局自对弈 u 平均（晋级门槛条件②用）。
     """
     weights = np.asarray(weights, dtype=np.float64)
-    opponent = BASELINE_WEIGHTS if opponent_weights is None else np.asarray(opponent_weights, dtype=np.float64)
-    summary = runner.evaluate_candidate(weights, opponent, greedy_seeds=greedy_seeds)
-    cost = (1.0 - summary.mean_u) / 2.0
+    incumbent = np.asarray(incumbent_weights, dtype=np.float64)
+    result = runner.validate_protocol(weights, incumbent, opponent_weights_list, greedy_seed=greedy_seed)
+    u_arr = np.asarray(result.u_values, dtype=np.float64)
+    self_play_arr = np.asarray(result.self_play_u_values, dtype=np.float64)
+    mean_u = float(u_arr.mean())
+    self_play_mean_u = float(self_play_arr.mean())
+    cost = (1.0 - mean_u) / 2.0
+    wins = int(np.count_nonzero(u_arr > 0))
+    losses = int(np.count_nonzero(u_arr < 0))
+    draws = int(np.count_nonzero(u_arr == 0))
     return {
         "weights": weights.tolist(),
-        "wins": summary.wins,
-        "draws": summary.draws,
-        "losses": summary.losses,
-        "mean_u": summary.mean_u,
+        "wins": wins,
+        "draws": draws,
+        "losses": losses,
+        "mean_u": mean_u,
         "cost": cost,
-        "u_values": list(summary.u_values),
+        "u_values": list(result.u_values),
+        "self_play_mean_u": self_play_mean_u,
+        "self_play_u_values": list(result.self_play_u_values),
         "games": [
             {
                 "black_count": g.black_count,
@@ -279,9 +309,59 @@ def validate_weights(weights, runner: MatchRunner, greedy_seeds, opponent_weight
                 "steps": g.steps,
                 "seed": g.seed,
             }
-            for g in summary.games
+            for g in result.games
         ],
     }
+
+
+def load_champion_pool() -> List[Dict]:
+    """读取冠军池，返回按 cycle_index 升序的条目列表。"""
+    if not os.path.exists(_CHAMPION_POOL_PATH):
+        return []
+    try:
+        with open(_CHAMPION_POOL_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    champions = data.get("champions", [])
+    return sorted(champions, key=lambda c: c.get("cycle_index", 0))
+
+
+def select_fixed_opponents(champions: List[Dict], incumbent_weights, logger: Logger) -> List[list]:
+    """从冠军池选择固定对手：不含现任冠军，按 validation_cost 升序取前 3。"""
+    incumbent_arr = np.asarray(incumbent_weights, dtype=np.float64)
+    non_current = []
+    for c in champions:
+        try:
+            w = np.asarray(c.get("weights"), dtype=np.float64)
+        except (TypeError, ValueError):
+            continue
+        if w.shape == (5,) and not np.allclose(w, incumbent_arr):
+            non_current.append(c)
+    non_current.sort(key=lambda c: c.get("validation_cost", 1.0))
+    top3 = non_current[:3]
+    logger.log(
+        f"[pool] fixed opponents (top3 by cost) = {[c.get('cycle_index') for c in top3]}"
+    )
+    return [c["weights"] for c in top3]
+
+
+def append_champion_to_pool(champions: List[Dict], cycle_index: int, winner_weights,
+                            winner_validation_cost: float, logger: Logger) -> None:
+    """把新冠军追加进池（validation_cost = 其 24 局验证 cost）。"""
+    entry = {
+        "cycle_index": cycle_index,
+        "weights": [float(x) for x in np.asarray(winner_weights, dtype=np.float64)],
+        "validation_cost": float(winner_validation_cost),
+        "promoted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    champions.append(entry)
+    champions.sort(key=lambda c: c.get("cycle_index", 0))
+    os.makedirs(os.path.dirname(_CHAMPION_POOL_PATH), exist_ok=True)
+    with open(_CHAMPION_POOL_PATH, "w", encoding="utf-8") as f:
+        json.dump({"champions": champions}, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    logger.log(f"[pool] appended champion cycle_index={cycle_index}")
 
 
 _TERMINAL_CANDIDATE_STATUSES = ("promoted", "evaluated", "rejected")
@@ -393,13 +473,6 @@ def run_plan9_cycle(
     selfplay=True 时，训练 objective 的固定陪练从 baseline 权重换成当前 incumbent
     冠军权重（self-play 自我迭代训练目标），验证/H2H/晋级规则不变。
     """
-    validation_seed_1 = 601 + 2 * (cycle_index - 1)
-    validation_seed_2 = 602 + 2 * (cycle_index - 1)
-    validation_seeds = (validation_seed_1, validation_seed_2)
-    h2h_seed_1 = 701 + 2 * (cycle_index - 1)
-    h2h_seed_2 = 702 + 2 * (cycle_index - 1)
-    h2h_seeds = (h2h_seed_1, h2h_seed_2)
-
     run_dir = os.path.join(_TRAINING_RUNS_DIR, run_id)
     os.makedirs(run_dir, exist_ok=True)
 
@@ -408,6 +481,10 @@ def run_plan9_cycle(
     version = next_version_number()
     backup_meta = backup_submission(logger, version)
     source_hashes = {p: sha256_file(os.path.join(_PROJECT_ROOT, p)) for p in _SOURCE_FILES}
+
+    # 冠军池：读取历史冠军，选择固定对手（不含现任冠军，按 validation_cost 升序取前 3）。
+    champions = load_champion_pool()
+    fixed_opponent_weights = select_fixed_opponents(champions, incumbent_weights, logger)
 
     # 训练 objective 配置（selfplay 4 冠军 + 2 贪心，match 2 baseline + 4 贪心）。
     if selfplay:
@@ -446,8 +523,13 @@ def run_plan9_cycle(
         "training_greedy_seeds": list(training_greedy_seeds),
         "baseline_weight": baseline_weight,
         "greedy_weight": greedy_weight,
-        "validation_greedy_seeds": list(validation_seeds),
-        "h2h_seeds": list(h2h_seeds),
+        "validation_protocol": "24 games: 8 selfplay vs incumbent (4W+4B) + 16 fixed pool (3 champions + greedy, 2W+2B each)",
+        "champion_pool": [
+            {"cycle_index": c["cycle_index"], "validation_cost": c["validation_cost"]}
+            for c in champions
+        ],
+        "fixed_opponent_weights": [list(w) for w in fixed_opponent_weights],
+        "pool_greedy_seed": POOL_GREEDY_SEED,
         "search_depth": DEPTH,
         "source_hashes": source_hashes,
         "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -458,7 +540,7 @@ def run_plan9_cycle(
 
     logger.log(
         f"[config] cycle_index={cycle_index} run_id={run_id} training_seed={training_seed} "
-        f"validation_seeds={validation_seeds} h2h_seeds={h2h_seeds}"
+        f"fixed_opponents={len(fixed_opponent_weights)} pool_greedy_seed={POOL_GREEDY_SEED}"
     )
     logger.log(f"[config] incumbent_weights={np.round(incumbent_weights, 6).tolist()}")
     logger.log(f"[config] baseline_weights={BASELINE_LIST}")
@@ -553,11 +635,11 @@ def run_plan9_cycle(
             },
         })
 
-    # Step 4：同一配置下独立实战验证（incumbent + 每个 challenger）。
-    logger.log("[validation] challengers vs incumbent (same protocol) ...")
+    # Step 4：24 局验证协议（incumbent + 每个 challenger）。
+    logger.log("[validation] 24-game protocol (incumbent + challengers) ...")
     runner = MatchRunner(depth=DEPTH)
     incumbent_validation = validate_weights(
-        incumbent_weights, runner, validation_seeds, opponent_weights=incumbent_weights
+        incumbent_weights, runner, incumbent_weights, fixed_opponent_weights, POOL_GREEDY_SEED
     )
     incumbent_cost = incumbent_validation["cost"]
     with open(os.path.join(run_dir, "incumbent_validation.json"), "w", encoding="utf-8") as f:
@@ -565,21 +647,28 @@ def run_plan9_cycle(
     logger.log(
         f"[validation] incumbent cost={incumbent_cost:.9f} "
         f"mean_u={incumbent_validation['mean_u']:.6f} "
+        f"self_play_mean_u={incumbent_validation['self_play_mean_u']:.6f} "
         f"W/D/L={incumbent_validation['wins']}/{incumbent_validation['draws']}/{incumbent_validation['losses']}"
     )
 
     for ch in challengers:
         ch["validation"] = validate_weights(
-            ch["weights"], runner, validation_seeds, opponent_weights=incumbent_weights
+            ch["weights"], runner, incumbent_weights, fixed_opponent_weights, POOL_GREEDY_SEED
         )
         ch["validation_cost"] = ch["validation"]["cost"]
+        ch["self_play_mean_u"] = ch["validation"]["self_play_mean_u"]
         label = ch["candidate_id"] or "match_ncs_candidate"
         logger.log(
             f"[validation] {label} cost={ch['validation_cost']:.9f} "
             f"mean_u={ch['validation']['mean_u']:.6f} "
+            f"self_play_mean_u={ch['self_play_mean_u']:.6f} "
             f"W/D/L={ch['validation']['wins']}/{ch['validation']['draws']}/{ch['validation']['losses']}"
         )
-        ch["do_h2h"] = ch["validation_cost"] < incumbent_cost
+        # 晋级门槛：① 24 局 cost 严格低于 incumbent；② 对现任冠军 8 局 mean_u > 0。
+        ch["qualified"] = (
+            ch["validation_cost"] < incumbent_cost
+            and ch["self_play_mean_u"] > 0.0
+        )
 
     match_val = next(c for c in challengers if c["kind"] == "match_ncs")["validation"]
     with open(os.path.join(run_dir, "candidate_validation.json"), "w", encoding="utf-8") as f:
@@ -594,46 +683,30 @@ def run_plan9_cycle(
         with open(os.path.join(run_dir, "preference_candidate_validation.json"), "w", encoding="utf-8") as f:
             json.dump(pref_val, f, indent=2, ensure_ascii=False)
 
-    # Step 5：H2H（仅对通过验证门槛的 challenger）。
+    # Step 5：晋级门槛已在 Step 4 判定（24 局 cost + 8 局自对弈 mean_u）。
     for ch in challengers:
-        ch["h2h"] = None
-        ch["qualified"] = False
         label = ch["candidate_id"] or "match_ncs_candidate"
-        if not ch["do_h2h"]:
+        if not ch["qualified"]:
             logger.log(
-                f"[h2h] skip {label}: validation cost ({ch['validation_cost']:.9f}) "
-                f">= incumbent ({incumbent_cost:.9f})"
+                f"[gate] {label} NOT qualified: "
+                f"cost={ch['validation_cost']:.9f} (incumbent {incumbent_cost:.9f}), "
+                f"self_play_mean_u={ch['self_play_mean_u']:.6f}"
             )
-            continue
-        logger.log(f"[h2h] {label} validation gate passed, running H2H seeds={h2h_seeds} ...")
-        res = runner.head_to_head(ch["weights"], incumbent_weights, seeds=h2h_seeds)
-        ch["h2h"] = {
-            "u_values": list(res.u_values),
-            "mean_u": res.mean_u,
-            "challenger_wins": res.challenger_wins,
-            "games": [
-                {"black_count": g.black_count, "white_count": g.white_count,
-                 "steps": g.steps, "seed": g.seed}
-                for g in res.games
-            ],
-        }
-        ch["qualified"] = res.mean_u > 0.0
-        h2h_fname = "h2h.json" if ch["kind"] == "match_ncs" else f"h2h_preference_{ch['candidate_id']}.json"
-        with open(os.path.join(run_dir, h2h_fname), "w", encoding="utf-8") as f:
-            json.dump(ch["h2h"], f, indent=2, ensure_ascii=False)
-        logger.log(
-            f"[h2h] {label} u_values={ch['h2h']['u_values']} "
-            f"mean_u={res.mean_u:.6f} challenger_wins={res.challenger_wins}"
-        )
+        else:
+            logger.log(
+                f"[gate] {label} qualified: "
+                f"cost={ch['validation_cost']:.9f} < {incumbent_cost:.9f} AND "
+                f"self_play_mean_u={ch['self_play_mean_u']:.6f} > 0"
+            )
 
-    # Step 6：当多个候选通过时的唯一选择规则。
+    # Step 6：当多个候选通过时的唯一选择规则（self_play_mean_u 即原 H2H mean_u）。
     qualified = [c for c in challengers if c["qualified"]]
     winner = None
     if len(qualified) == 1:
         winner = qualified[0]
     elif len(qualified) > 1:
         qualified.sort(key=lambda c: (
-            -c["h2h"]["mean_u"],
+            -c["self_play_mean_u"],
             c["validation_cost"],
             0 if c["kind"] == "match_ncs" else 1,
         ))
@@ -648,7 +721,7 @@ def run_plan9_cycle(
     if winner is not None:
         winner_label = winner["candidate_id"] or "match_ncs_candidate"
         logger.log(
-            f"[promote] winner={winner_label} h2h_mean_u={winner['h2h']['mean_u']:.6f} "
+            f"[promote] winner={winner_label} self_play_mean_u={winner['self_play_mean_u']:.6f} "
             f"validation_cost={winner['validation_cost']:.9f}"
         )
         try:
@@ -659,10 +732,14 @@ def run_plan9_cycle(
             logger.log(f"[promote] writeback FAILED: {exc}")
             reason = "promotion qualified but submission writeback failed"
     else:
-        reason = "no challenger passed both validation and H2H"
+        reason = "no challenger passed validation gate (24-game cost + self-play mean_u)"
         logger.log("[promote] no winner -> keep incumbent (no update)")
     if winner is not None and update_applied:
         reason = None
+        # 把新冠军追加进冠军池（validation_cost = 其 24 局验证 cost）。
+        append_champion_to_pool(
+            champions, cycle_index, winner["weights"], winner["validation_cost"], logger
+        )
 
     # Step 8：记录偏好候选消费状态（无论通过还是拒绝）。
     if preference_candidate is not None:
@@ -686,7 +763,7 @@ def run_plan9_cycle(
                 "candidate_id": winner["candidate_id"],
                 "weights": winner["weights"].tolist(),
                 "validation_cost": winner["validation_cost"],
-                "h2h_mean_u": winner["h2h"]["mean_u"] if winner["h2h"] else None,
+                "self_play_mean_u": winner["self_play_mean_u"],
             }
             if winner is not None else None
         ),
@@ -697,8 +774,7 @@ def run_plan9_cycle(
                 "weights": c["weights"].tolist(),
                 "validation_cost": c["validation_cost"],
                 "validation_mean_u": c["validation"]["mean_u"],
-                "gate_validation_passed": c["do_h2h"],
-                "gate_h2h_mean_u": c["h2h"]["mean_u"] if c["h2h"] else None,
+                "self_play_mean_u": c["self_play_mean_u"],
                 "qualified": c["qualified"],
             }
             for c in challengers
@@ -707,6 +783,7 @@ def run_plan9_cycle(
             "weights": incumbent_weights.tolist(),
             "validation_cost": incumbent_cost,
             "validation_mean_u": incumbent_validation["mean_u"],
+            "self_play_mean_u": incumbent_validation["self_play_mean_u"],
         },
         "submission_updated": update_applied,
         "reason_not_updated": reason,

@@ -25,7 +25,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from reversi.board import (
-    BOARD_SIZE, COLOR_BLACK, COLOR_WHITE, count, initial_board, opponent,
+    BOARD_SIZE, COLOR_BLACK, COLOR_WHITE, count, initial_board_array, opponent,
 )
 from reversi.rules import apply_move, flips, is_terminal, legal_moves
 
@@ -145,7 +145,7 @@ def reconstruct_game(snapshots: List[np.ndarray]) -> Tuple[List[Dict], bool]:
     之后每两帧之间按“实际轮到方”穷举合法落子并要求唯一匹配；若当前方无合法走法，
     仅当规则允许（非终局）时 pass 跳过该方，不因不匹配而静默改变颜色次序。
     """
-    board = initial_board()
+    board = initial_board_array()
     side = COLOR_BLACK  # 黑先
     actions: List[Dict] = []
     ply = 0
@@ -453,17 +453,18 @@ def discover_source_files(training_dir: str) -> Dict[str, str]:
 
     首选读取 training/raw/ 下的直接子文件；也允许读取 training/ 根目录下的直接子级
     棋谱文件。绝不递归扫描 processed/、datasets/、preference_runs/、candidates/ 等生成目录。
+    只接受与元数据约定一致的 chess_log_n.txt 和 n.txt，忽略冠军池等控制文件。
     """
     sources: Dict[str, str] = {}
     raw_dir = os.path.join(training_dir, "raw")
     if os.path.isdir(raw_dir):
         for name in sorted(os.listdir(raw_dir)):
             p = os.path.join(raw_dir, name)
-            if os.path.isfile(p):
+            if os.path.isfile(p) and (_CHESS_LOG_RE.fullmatch(name) or _WHITE_LOG_RE.fullmatch(name)):
                 sources["raw/" + name] = p
     for name in sorted(os.listdir(training_dir)):
         p = os.path.join(training_dir, name)
-        if not os.path.isfile(p):
+        if not os.path.isfile(p) or not (_CHESS_LOG_RE.fullmatch(name) or _WHITE_LOG_RE.fullmatch(name)):
             continue
         if name == _MANIFEST_CSV_NAME:
             continue
@@ -598,7 +599,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"  [duplicate] {f['source_relative_path']} (of {f['duplicate_of']})")
         else:
             print(f"  [failed]   {f['source_relative_path']}: {f.get('reason')} {f.get('detail', '')}")
-    return 0
+    return 1 if counts["failed"] else 0
 
 
 if __name__ == "__main__":
