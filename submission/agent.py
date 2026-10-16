@@ -1,6 +1,5 @@
 import math
 import time
-
 import numpy as np
 import numba
 
@@ -106,7 +105,6 @@ def apply_move(board, color, move):
     return new_board
 
 # 评估标准, 博弈辅助
-
 POSITION_TABLE = np.array([
     [120, -20,  20,   5,   5,  20, -20, 120],
     [-20, -40,  -5,  -5,  -5,  -5, -40, -20],
@@ -183,10 +181,8 @@ UPPER = 2
 
 _TIME_CHECK_MASK = 2047
 
-
 class _SearchTimeout(Exception):
     pass
-
 
 class _SearchContext(object):
     __slots__ = ("weights", "tt", "history", "killers", "deadline", "nodes", "timed_out")
@@ -204,16 +200,13 @@ class _SearchContext(object):
         self.nodes = 0
         self.timed_out = False
 
-
 def _board_key(board):
     return board.tobytes()
-
 
 def _check_time(ctx):
     if ctx.deadline is not None and time.perf_counter() >= ctx.deadline:
         ctx.timed_out = True
         raise _SearchTimeout()
-
 
 def _order_moves(ctx, color, moves, depth):
     killers = ctx.killers.get(depth)
@@ -227,7 +220,6 @@ def _order_moves(ctx, color, moves, depth):
         scored.append((score, move))
     scored.sort(key=lambda item: -item[0])
     return [m for _, m in scored]
-
 
 def _negamax(ctx, board, color, depth, alpha, beta):
     ctx.nodes += 1
@@ -292,7 +284,6 @@ def _negamax(ctx, board, color, depth, alpha, beta):
     ctx.tt[key] = (depth, flag, best, best_move)
     return best
 
-
 def _best_move_with_context(ctx, board, color, depth):
     moves = legal_moves(board, color)
     if not moves:
@@ -313,11 +304,9 @@ def _best_move_with_context(ctx, board, color, depth):
             alpha = score
     return best
 
-
 def best_move(board, color, depth, weights):
     ctx = _SearchContext(weights, time_budget=None)
     return _best_move_with_context(ctx, board, color, depth)
-
 
 def best_move_iterative(board, color, max_depth, weights, time_budget=None):
     moves = legal_moves(board, color)
@@ -340,10 +329,9 @@ _SEARCH_DEPTH = 4
 
 # BEGIN AUTO-UPDATED FINAL WEIGHTS
 _FIXED_WEIGHTS = np.array(
-    [-7.564687797463808, 9.019126725871288, 0.26414041262129473, -5.71691508627605, 0.5947836619489912],
+    [-9.829344707089222, -1.6352737174295697, 2.1452851290855097, -8.925819212691634, -10.0],
     dtype=np.float64,
 )
-# END AUTO-UPDATED FINAL WEIGHTS
 
 class AI(object):
     # chessboard_size, color, time_out passed from agent
@@ -355,7 +343,7 @@ class AI(object):
         self.weights = _FIXED_WEIGHTS.copy()
         self.depth = _SEARCH_DEPTH
 
-    # The input is the current chessboard (a numpy array).
+    # 输入棋盘序列
     def go(self, chessboard):
         # Clear candidate_list, must do this step
         self.candidate_list.clear()
