@@ -8,7 +8,7 @@ import numpy as np
 
 from optimization.objective import EvaluationResult
 
-from .match_runner import MatchRunner
+from .match_runner import SEARCH_MAX_DEPTH, MatchRunner
 
 DECODE_SCALE = 20.0
 DECODE_OFFSET = -10.0
@@ -17,7 +17,7 @@ DECODE_OFFSET = -10.0
 class ReversiObjective:
     """候选权重（归一化 z ∈ [0,1]^5）的固定训练目标。"""
 
-    def __init__(self, baseline_weights, depth=4, greedy_seeds=(101, 202),
+    def __init__(self, baseline_weights, depth=SEARCH_MAX_DEPTH, greedy_seeds=(101, 202),
                  baseline_weight=1.0, greedy_weight=1.0):
         self.baseline_weights = np.asarray(baseline_weights, dtype=np.float64)
         if self.baseline_weights.shape != (5,):
@@ -60,7 +60,8 @@ class ReversiObjective:
             "mean_u": summary.mean_u,
             "weights": weights.copy(),
             "per_game": [
-                {"seed": g.seed, "steps": g.steps, "elapsed": g.elapsed, "u": u}
+                {"seed": g.seed, "steps": g.steps, "elapsed": g.elapsed, "u": u,
+                 "search_stats": g.search_stats}
                 for g, u in zip(summary.games, summary.u_values)
             ],
         }

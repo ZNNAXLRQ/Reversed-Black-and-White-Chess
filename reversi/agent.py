@@ -17,7 +17,7 @@ from .search import best_move_iterative
 BASELINE_WEIGHTS = np.array([-1.0, 1.0, 1.0, 1.0, -1.0], dtype=np.float64)
 
 # 迭代加深的绝对深度上限（实际深度由 time_out 时间预算动态决定，不会超过此值）。
-# 设为 4：与训练/验证/H2H 统一深度一致，保证每步 <5s、整局 <180s。
+# 保留浅层基准接口深度 4；正式部署与训练上限为 10，不作墙钟保证。
 SEARCH_DEPTH = 4
 
 

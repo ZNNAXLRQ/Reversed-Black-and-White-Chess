@@ -29,7 +29,7 @@ from optimization.ncs.optimizer import NCSConfig, NCSOptimizer
 from optimization.parameter_space import ParameterSpace
 from reversi.agent import BASELINE_WEIGHTS
 
-from .match_runner import MatchRunner
+from .match_runner import SEARCH_MAX_DEPTH, SEARCH_NODE_LIMIT, MatchRunner
 from .reversi_objective import ReversiObjective
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -52,8 +52,8 @@ SIGMA0 = 0.1
 R = 0.99
 EPOCH = 10
 
-# 搜索深度与对局种子（自本任务起统一为 4，与正式 Agent _SEARCH_DEPTH 一致）
-DEPTH = 4
+# 与部署一致的迭代加深上限；实际训练深度由确定性节点预算决定。
+DEPTH = SEARCH_MAX_DEPTH
 TRAINING_GREEDY_SEEDS = (101, 202)
 # 验证协议中固定池的反转贪心对手种子（方向二：固定 seed 999）。
 POOL_GREEDY_SEED = 999
@@ -308,6 +308,8 @@ def validate_weights(weights, runner: MatchRunner, incumbent_weights,
                 "white_count": g.white_count,
                 "steps": g.steps,
                 "seed": g.seed,
+                "elapsed": g.elapsed,
+                "search_stats": g.search_stats,
             }
             for g in result.games
         ],
@@ -531,6 +533,9 @@ def run_plan9_cycle(
         "fixed_opponent_weights": [list(w) for w in fixed_opponent_weights],
         "pool_greedy_seed": POOL_GREEDY_SEED,
         "search_depth": DEPTH,
+        "search_policy": "iterative_completed_iterations_v1",
+        "search_node_limit": SEARCH_NODE_LIMIT,
+        "search_endgame_policy": "bounded_iterations_then_terminal_depth_at_14_empties",
         "source_hashes": source_hashes,
         "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "backup": backup_meta,

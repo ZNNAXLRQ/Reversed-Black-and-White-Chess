@@ -23,7 +23,7 @@ EXACT = 0
 LOWER = 1
 UPPER = 2
 
-# 终局精确搜索阈值：剩余空格 <= 该值时不再用启发式评估，直接精确搜到底。
+# 终局目标阈值：迭代搜索逐层尝试解出；保留的固定深度接口可强制求解。
 ENDGAME_EMPTY_THRESHOLD = 14
 
 _TT_SIZE = 1 << 16
@@ -108,14 +108,13 @@ def _order_moves_nb(moves_mask, depth, color, killers, history):
 @numba.njit
 def _negamax_nb(me, opp, color, depth, alpha, beta, weights,
                 tt_key, tt_depth, tt_flag, tt_val, tt_move,
-                killers, history, nodes, abort, node_limit):
-    nodes[0] += 1
+                killers, history, nodes, abort, node_limit, solve_endgame=True):
     if abort[0] != 0:
         return 0.0
-    if (nodes[0] & 2047) == 0:
-        if node_limit[0] > 0 and nodes[0] >= node_limit[0]:
-            abort[0] = 1
-            return 0.0
+    if node_limit[0] > 0 and nodes[0] >= node_limit[0]:
+        abort[0] = 1
+        return 0.0
+    nodes[0] += 1
 
     key = _hash(color, me, opp)
     idx = int(key & np.uint64(_TT_SIZE - 1))
@@ -136,11 +135,11 @@ def _negamax_nb(me, opp, color, depth, alpha, beta, weights,
         if _legal_mask_nb(opp, me) != np.uint64(0):
             return -_negamax_nb(opp, me, -color, depth, -beta, -alpha,
                                 weights, tt_key, tt_depth, tt_flag, tt_val, tt_move,
-                                killers, history, nodes, abort, node_limit)
+                                killers, history, nodes, abort, node_limit, solve_endgame)
         return _terminal_utility_nb(me, opp)
 
     empty = 64 - _popcount(me | opp)
-    if empty <= ENDGAME_EMPTY_THRESHOLD:
+    if solve_endgame and empty <= ENDGAME_EMPTY_THRESHOLD:
         depth = max(depth, ENDGAME_EMPTY_THRESHOLD)
     elif depth <= 0:
         return _evaluate_nb(me, opp, weights)
@@ -157,7 +156,10 @@ def _negamax_nb(me, opp, color, depth, alpha, beta, weights,
         cme, copp = _apply_move_nb(me, opp, bit)
         score = -_negamax_nb(copp, cme, -color, depth - 1, -beta, -alpha,
                              weights, tt_key, tt_depth, tt_flag, tt_val, tt_move,
-                             killers, history, nodes, abort, node_limit)
+                             killers, history, nodes, abort, node_limit, solve_endgame)
+        # 中断值不是评分或界，不能污染 TT、杀手或历史表。
+        if abort[0] != 0:
+            return 0.0
         if score > best:
             best = score
             best_move = mi
@@ -191,7 +193,7 @@ def _negamax_nb(me, opp, color, depth, alpha, beta, weights,
 @numba.njit
 def _best_move_nb(me, opp, color, depth, weights,
                   tt_key, tt_depth, tt_flag, tt_val, tt_move,
-                  killers, history, nodes, abort, node_limit):
+                  killers, history, nodes, abort, node_limit, solve_endgame=True):
     moves_mask = _legal_mask_nb(me, opp)
     if moves_mask == np.uint64(0):
         return -1
@@ -206,7 +208,7 @@ def _best_move_nb(me, opp, color, depth, weights,
         cme, copp = _apply_move_nb(me, opp, bit)
         score = -_negamax_nb(copp, cme, -color, depth - 1, -beta, -alpha,
                              weights, tt_key, tt_depth, tt_flag, tt_val, tt_move,
-                             killers, history, nodes, abort, node_limit)
+                             killers, history, nodes, abort, node_limit, solve_endgame)
         if abort[0] != 0:
             break
         if score > best_score:
@@ -242,12 +244,12 @@ def _prepare(state, weights, time_budget, node_limit):
     state["weights"][:] = np.asarray(weights, dtype=np.float64)
 
 
-def _run(state, me, opp, color, depth):
+def _run(state, me, opp, color, depth, solve_endgame=True):
     return _best_move_nb(
         me, opp, color, depth, state["weights"],
         state["tt_key"], state["tt_depth"], state["tt_flag"], state["tt_val"], state["tt_move"],
         state["killers"], state["history"], state["nodes"], state["abort"],
-        state["node_limit"],
+        state["node_limit"], solve_endgame,
     )
 
 
@@ -262,21 +264,47 @@ def best_move(bb, color, depth, weights, time_budget=None, node_limit=None):
     return _to_coord(mi)
 
 
-def best_move_iterative(bb, color, max_depth, weights, time_budget=None, node_limit=None):
-    """迭代加深搜索：从 depth 1 到 max_depth，在时间/节点预算内尽量搜深。"""
+def best_move_iterative(bb, color, max_depth, weights, time_budget=None, node_limit=None,
+                        stats=None):
+    """确定性总节点预算、只提交完整层；终局逐层加深，避免首次求解吃光预算。
+
+    <=14 空时目标深度为剩余空格数（pass 不耗深度），完整达到才标记精确解出。
+    stats 为可选输出字典；墙钟仍只在层间检查，不是硬实时保证。
+    """
+    if not 1 <= max_depth <= _MAX_DEPTH:
+        raise ValueError("max_depth must be between 1 and 64")
     state = _new_state()
     _prepare(state, weights, time_budget, node_limit)
     me, opp = _masks(bb, color)
     moves = legal_moves(bb, color)
+    empties = 64 - int(me | opp).bit_count()
+    target = max(max_depth, empties) if empties <= ENDGAME_EMPTY_THRESHOLD else max_depth
+    result = dict(completed_depth=0, target_depth=target, nodes=0, interrupted=False,
+                  terminal_solved=False, fallback_used=False, stop_reason="max_depth")
     if not moves:
+        result.update(terminal_solved=not bool(legal_moves(bb, -color)), stop_reason="no_legal_move")
+        if stats is not None:
+            stats.clear()
+            stats.update(result)
         return None
     best = moves[0]
-    for d in range(1, max_depth + 1):
+    for d in range(1, target + 1):
         if time_budget is not None and time_budget > 0 and time.time() >= state["deadline"][0]:
+            result.update(interrupted=True, stop_reason="time_budget")
             break
-        mi = _run(state, me, opp, color, d)
+        # TT 只在同一种叶节点评估语义下复用：不在浅层偷偷切换到强制解终局。
+        mi = _run(state, me, opp, color, d, solve_endgame=False)
         if state["abort"][0] != 0:
+            result.update(interrupted=True, stop_reason="node_limit")
             break
         if mi >= 0:
             best = _to_coord(mi)
+            result["completed_depth"] = d
+        if d >= empties:
+            result.update(terminal_solved=True, stop_reason="terminal_solved")
+            break
+    result.update(nodes=int(state["nodes"][0]), fallback_used=result["completed_depth"] == 0)
+    if stats is not None:
+        stats.clear()
+        stats.update(result)
     return best

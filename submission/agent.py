@@ -184,6 +184,22 @@ ENDGAME_EMPTY_THRESHOLD = 14
 _TT_SIZE = 1 << 16
 _MAX_DEPTH = 64
 
+def _new_state():
+    return {
+        "tt_key": np.zeros(_TT_SIZE, dtype=np.uint64),
+        "tt_depth": np.full(_TT_SIZE, -1, dtype=np.int8),
+        "tt_flag": np.zeros(_TT_SIZE, dtype=np.int8),
+        "tt_val": np.zeros(_TT_SIZE, dtype=np.float64),
+        "tt_move": np.full(_TT_SIZE, -1, dtype=np.int8),
+        "killers": np.full((_MAX_DEPTH + 1, 2), -1, dtype=np.int8),
+        "history": np.zeros((2, 64), dtype=np.float64),
+        "nodes": np.zeros(1, dtype=np.int64),
+        "abort": np.zeros(1, dtype=np.int8),
+        "deadline": np.zeros(1, dtype=np.float64),
+        "node_limit": np.zeros(1, dtype=np.int64),
+        "weights": np.zeros(5, dtype=np.float64),
+    }
+
 @numba.njit
 def _hash(color, me, opp):
     h = me ^ (opp * np.uint64(0x9E3779B97F4A7C15))
@@ -193,6 +209,16 @@ def _hash(color, me, opp):
     h *= np.uint64(0xBF58476D1CE4E5B9)
     h ^= h >> np.uint64(32)
     return h
+
+@numba.njit
+def _terminal_utility_nb(me, opp):
+    own = _popcount(me)
+    opp_n = _popcount(opp)
+    if own < opp_n:
+        return 1000.0 + (opp_n - own)
+    if own > opp_n:
+        return -1000.0 + (opp_n - own)
+    return 0.0
 
 @numba.njit
 def _order_moves_nb(moves_mask, depth, color, killers, history):
@@ -226,14 +252,15 @@ def _order_moves_nb(moves_mask, depth, color, killers, history):
     return moves, cnt
 
 @numba.njit
-def _negamax_nb(me, opp, color, depth, alpha, beta, weights, tt_key, tt_depth, tt_flag, tt_val, tt_move, killers, history, nodes, abort, node_limit):
-    nodes[0] += 1
+def _negamax_nb(me, opp, color, depth, alpha, beta, weights,
+                tt_key, tt_depth, tt_flag, tt_val, tt_move,
+                killers, history, nodes, abort, node_limit, solve_endgame=True):
     if abort[0] != 0:
         return 0.0
-    if (nodes[0] & 2047) == 0:
-        if node_limit[0] > 0 and nodes[0] >= node_limit[0]:
-            abort[0] = 1
-            return 0.0
+    if 0 < node_limit[0] <= nodes[0]:
+        abort[0] = 1
+        return 0.0
+    nodes[0] += 1
 
     key = _hash(color, me, opp)
     idx = int(key & np.uint64(_TT_SIZE - 1))
@@ -252,11 +279,13 @@ def _negamax_nb(me, opp, color, depth, alpha, beta, weights, tt_key, tt_depth, t
     moves_mask = _legal_mask_nb(me, opp)
     if moves_mask == np.uint64(0):
         if _legal_mask_nb(opp, me) != np.uint64(0):
-            return -_negamax_nb(opp, me, -color, depth, -beta, -alpha, weights, tt_key, tt_depth, tt_flag, tt_val, tt_move, killers, history, nodes, abort, node_limit)
+            return -_negamax_nb(opp, me, -color, depth, -beta, -alpha,
+                                weights, tt_key, tt_depth, tt_flag, tt_val, tt_move,
+                                killers, history, nodes, abort, node_limit, solve_endgame)
         return _terminal_utility_nb(me, opp)
 
     empty = 64 - _popcount(me | opp)
-    if empty <= ENDGAME_EMPTY_THRESHOLD:
+    if solve_endgame and empty <= ENDGAME_EMPTY_THRESHOLD:
         depth = max(depth, ENDGAME_EMPTY_THRESHOLD)
     elif depth <= 0:
         return _evaluate_nb(me, opp, weights)
@@ -271,7 +300,11 @@ def _negamax_nb(me, opp, color, depth, alpha, beta, weights, tt_key, tt_depth, t
         mi = moves[k]
         bit = np.uint64(1) << np.uint64(mi)
         cme, copp = _apply_move_nb(me, opp, bit)
-        score = -_negamax_nb(copp, cme, -color, depth - 1, -beta, -alpha, weights, tt_key, tt_depth, tt_flag, tt_val, tt_move, killers, history, nodes, abort, node_limit)
+        score = -_negamax_nb(copp, cme, -color, depth - 1, -beta, -alpha,
+                             weights, tt_key, tt_depth, tt_flag, tt_val, tt_move,
+                             killers, history, nodes, abort, node_limit, solve_endgame)
+        if abort[0] != 0:
+            return 0.0
         if score > best:
             best = score
             best_move = mi
@@ -302,7 +335,9 @@ def _negamax_nb(me, opp, color, depth, alpha, beta, weights, tt_key, tt_depth, t
     return best
 
 @numba.njit
-def _best_move_nb(me, opp, color, depth, weights, tt_key, tt_depth, tt_flag, tt_val, tt_move, killers, history, nodes, abort, node_limit):
+def _best_move_nb(me, opp, color, depth, weights,
+                  tt_key, tt_depth, tt_flag, tt_val, tt_move,
+                  killers, history, nodes, abort, node_limit, solve_endgame=True):
     moves_mask = _legal_mask_nb(me, opp)
     if moves_mask == np.uint64(0):
         return -1
@@ -315,7 +350,9 @@ def _best_move_nb(me, opp, color, depth, weights, tt_key, tt_depth, tt_flag, tt_
         mi = moves[k]
         bit = np.uint64(1) << np.uint64(mi)
         cme, copp = _apply_move_nb(me, opp, bit)
-        score = -_negamax_nb(copp, cme, -color, depth - 1, -beta, -alpha, weights, tt_key, tt_depth, tt_flag, tt_val, tt_move, killers, history, nodes, abort, node_limit)
+        score = -_negamax_nb(copp, cme, -color, depth - 1, -beta, -alpha,
+                             weights, tt_key, tt_depth, tt_flag, tt_val, tt_move,
+                             killers, history, nodes, abort, node_limit, solve_endgame)
         if abort[0] != 0:
             break
         if score > best_score:
@@ -325,41 +362,83 @@ def _best_move_nb(me, opp, color, depth, weights, tt_key, tt_depth, tt_flag, tt_
             alpha = score
     return best
 
+def _masks(bb, color):
+    if color == COLOR_BLACK:
+        return np.uint64(bb[0]), np.uint64(bb[1])
+    return np.uint64(bb[1]), np.uint64(bb[0])
 
-def best_move_iterative(bb, color, max_depth, weights, time_budget=None):
-    tt_key = np.zeros(_TT_SIZE, dtype=np.uint64)
-    tt_depth = np.full(_TT_SIZE, -1, dtype=np.int8)
-    tt_flag = np.zeros(_TT_SIZE, dtype=np.int8)
-    tt_val = np.zeros(_TT_SIZE, dtype=np.float64)
-    tt_move = np.full(_TT_SIZE, -1, dtype=np.int8)
-    killers = np.full((_MAX_DEPTH + 1, 2), -1, dtype=np.int8)
-    history = np.zeros((2, 64), dtype=np.float64)
-    nodes = np.zeros(1, dtype=np.int64)
-    abort = np.zeros(1, dtype=np.int8)
-    node_limit = np.zeros(1, dtype=np.int64)
-    if time_budget is not None and time_budget > 0:
-        # numba 核心内无法做墙钟时间检查，用节点上限兜底（约 50 万节点/秒）。
-        node_limit[0] = max(1, int(time_budget * 500000))
-    weights_arr = np.asarray(weights, dtype=np.float64)
+def _to_coord(mi):
+    return int(mi) // 8, int(mi) % 8
 
-    me = np.uint64(bb[0]) if color == COLOR_BLACK else np.uint64(bb[1])
-    opp = np.uint64(bb[1]) if color == COLOR_BLACK else np.uint64(bb[0])
-    moves = legal_moves(bb, color)
-    if not moves:
+def _prepare(state, weights, time_budget, node_limit):
+    state["tt_depth"].fill(-1)
+    state["tt_move"].fill(-1)
+    state["killers"].fill(-1)
+    state["history"].fill(0.0)
+    state["nodes"][0] = 0
+    state["abort"][0] = 0
+    state["deadline"][0] = (time.time() + time_budget) if (time_budget is not None and time_budget > 0) else 0.0
+    # numba 核心内无法做墙钟时间检查；若只给了 time_budget，用节点上限兜底。
+    if node_limit is None and time_budget is not None and time_budget > 0:
+        node_limit = max(1, int(time_budget * 500000))
+    state["node_limit"][0] = node_limit if (node_limit is not None and node_limit > 0) else 0
+    state["weights"][:] = np.asarray(weights, dtype=np.float64)
+
+def _run(state, me, opp, color, depth, solve_endgame=True):
+    return _best_move_nb(
+        me, opp, color, depth, state["weights"],
+        state["tt_key"], state["tt_depth"], state["tt_flag"], state["tt_val"], state["tt_move"],
+        state["killers"], state["history"], state["nodes"], state["abort"],
+        state["node_limit"], solve_endgame,
+    )
+
+def best_move(bb, color, depth, weights, time_budget=None, node_limit=None):
+    state = _new_state()
+    _prepare(state, weights, time_budget, node_limit)
+    me, opp = _masks(bb, color)
+    mi = _run(state, me, opp, color, depth)
+    if mi < 0:
         return None
+    return _to_coord(mi)
 
-    deadline = (time.time() + time_budget) if (time_budget and time_budget > 0) else 0.0
+def best_move_iterative(bb, color, max_depth, weights, time_budget=None, node_limit=None,
+                        stats=None):
+    if not 1 <= max_depth <= _MAX_DEPTH:
+        raise ValueError("max_depth must be between 1 and 64")
+    state = _new_state()
+    _prepare(state, weights, time_budget, node_limit)
+    me, opp = _masks(bb, color)
+    moves = legal_moves(bb, color)
+    empties = 64 - int(me | opp).bit_count()
+    target = max(max_depth, empties) if empties <= ENDGAME_EMPTY_THRESHOLD else max_depth
+    result = dict(completed_depth=0, target_depth=target, nodes=0, interrupted=False,
+                  terminal_solved=False, fallback_used=False, stop_reason="max_depth")
+    if not moves:
+        result.update(terminal_solved=not bool(legal_moves(bb, -color)), stop_reason="no_legal_move")
+        if stats is not None:
+            stats.clear()
+            stats.update(result)
+        return None
     best = moves[0]
-    for d in range(1, max_depth + 1):
-        if deadline > 0.0 and time.time() >= deadline:
+    for d in range(1, target + 1):
+        if time_budget is not None and time_budget > 0 and time.time() >= state["deadline"][0]:
+            result.update(interrupted=True, stop_reason="time_budget")
             break
-        mi = _best_move_nb(me, opp, color, d, weights_arr,
-                           tt_key, tt_depth, tt_flag, tt_val, tt_move,
-                           killers, history, nodes, abort, node_limit)
-        if abort[0] != 0:
+        # TT 只在同一种叶节点评估语义下复用：不在浅层偷偷切换到强制解终局。
+        mi = _run(state, me, opp, color, d, solve_endgame=False)
+        if state["abort"][0] != 0:
+            result.update(interrupted=True, stop_reason="node_limit")
             break
         if mi >= 0:
-            best = (int(mi) // 8, int(mi) % 8)
+            best = _to_coord(mi)
+            result["completed_depth"] = d
+        if d >= empties:
+            result.update(terminal_solved=True, stop_reason="terminal_solved")
+            break
+    result.update(nodes=int(state["nodes"][0]), fallback_used=result["completed_depth"] == 0)
+    if stats is not None:
+        stats.clear()
+        stats.update(result)
     return best
 
 # AI 接口与权重参数
@@ -367,7 +446,7 @@ _SEARCH_DEPTH = 10
 
 # BEGIN AUTO-UPDATED FINAL WEIGHTS
 _FIXED_WEIGHTS = np.array(
-    [-6.33247672352715, -3.629403162945928, 0.9349258943961338, -9.421310195876254, -0.6242989774127423],
+    [-0.6033475472115732, -10.0, 1.4433786818495893, -5.322109390395889, -8.180184680675023],
     dtype=np.float64,
 )
 # END AUTO-UPDATED FINAL WEIGHTS

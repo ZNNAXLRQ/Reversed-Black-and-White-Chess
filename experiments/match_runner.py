@@ -13,7 +13,10 @@ import numpy as np
 
 from reversi.board import COLOR_BLACK, COLOR_WHITE, count, initial_board, opponent
 from reversi.rules import apply_move, is_terminal, legal_moves
-from reversi.search import best_move
+from reversi.search import best_move_iterative
+
+SEARCH_MAX_DEPTH = 10
+SEARCH_NODE_LIMIT = 2000
 
 
 class ObjectiveEvaluationError(RuntimeError):
@@ -29,6 +32,7 @@ class GameResult:
     steps: int
     elapsed: float
     seed: Optional[int] = None
+    search_stats: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -68,17 +72,18 @@ class ValidationResult:
 class WeightedAgent:
     """权重 AI：使用给定权重与搜索深度（确定性走法顺序）。
 
-    node_limit 用于终局精确搜索（empty <= 阈值）的确定性节点数上限回退；
-    非终局深度浅、不受影响，语义不变。
+    与部署使用相同迭代加深语义，训练仅使用确定性总节点预算。
     """
 
-    def __init__(self, weights, depth=4, node_limit=5000):
+    def __init__(self, weights, depth=SEARCH_MAX_DEPTH, node_limit=SEARCH_NODE_LIMIT):
         self.weights = np.asarray(weights, dtype=np.float64)
         self.depth = depth
         self.node_limit = node_limit
+        self.last_search_stats = {}
 
     def select_move(self, board, color, moves, seed=None):
-        return best_move(board, color, self.depth, self.weights, node_limit=self.node_limit)
+        return best_move_iterative(board, color, self.depth, self.weights,
+                                   node_limit=self.node_limit, stats=self.last_search_stats)
 
 
 class GreedyAgent:
@@ -103,7 +108,7 @@ class GreedyAgent:
 class MatchRunner:
     """对局运行器：play_game / evaluate_candidate / head_to_head。"""
 
-    def __init__(self, depth=4, node_limit=5000):
+    def __init__(self, depth=SEARCH_MAX_DEPTH, node_limit=SEARCH_NODE_LIMIT):
         self.depth = depth
         self.node_limit = node_limit
 
@@ -111,6 +116,7 @@ class MatchRunner:
         board = initial_board()
         color = COLOR_BLACK
         steps = 0
+        search_stats = []
         start = time.time()
         try:
             while not is_terminal(board):
@@ -118,6 +124,8 @@ class MatchRunner:
                 if moves:
                     agent = black_agent if color == COLOR_BLACK else white_agent
                     move = agent.select_move(board, color, moves, seed)
+                    if isinstance(agent, WeightedAgent):
+                        search_stats.append(dict(color=color, **agent.last_search_stats))
                     if move not in moves:
                         raise ObjectiveEvaluationError(
                             f"illegal move {move} by color {color}; "
@@ -141,6 +149,7 @@ class MatchRunner:
             steps=steps,
             elapsed=elapsed,
             seed=seed,
+            search_stats=search_stats,
         )
 
     def evaluate_candidate(self, weights, baseline_weights, greedy_seeds=(101, 202),
