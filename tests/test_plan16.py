@@ -364,7 +364,7 @@ def test_champion_pool_selection():
     ]
     incumbent = np.array([9.0, 9.0, 9.0, 9.0, 9.0])
     selected = select_fixed_opponents(champions, incumbent, _FakeLogger())
-    assert selected == [[0, 1, 0, 0, 0], [0, 0, 0, 1, 0], [0, 0, 1, 0, 0]]
+    assert selected == [[1, 0, 0, 0, 0], [0, 1, 0, 0, 0], [0, 0, 0, 1, 0]]
 
 
 # ---------------------------------------------------------------------------

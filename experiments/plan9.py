@@ -1,17 +1,8 @@
 """Plan 9：重复 NCS 训练、候选晋级与提交代码更新（单周期执行入口）。
 
-严格按 plans/Plan_9_Task_9.md 完成一个训练周期：
-
-1. 建立可追溯运行记录（run_id 目录 + config + 源码摘要 + 提交版本备份）；
-2. 用固定扩展预算运行 NCS-C（N=10, T_max=20, sigma0=0.1, r=0.99, epoch=10），
-   Objective 始终只使用固定 baseline AI 与反转贪心 AI（种子 101/202），每候选 6 局；
-3. 用当周期独立验证种子（601/602）对候选 BestFound 与当前 incumbent 做同协议 6 局验证；
-4. 仅当 challenger_validation_cost < incumbent_validation_cost 时执行 H2H（种子 701/702）；
-5. 仅当 H2H mean_u > 0 才把候选写入 submission/agent.py 的最终权重标记块；
-6. 保存本周期全部产物，绝不覆盖既有运行目录。
-
-本模块复用已通过验收的 NCSOptimizer / ParameterSpace / ReversiObjective / MatchRunner，
-只负责编排，不重写算法、特征、Objective 或晋级规则。
+当前协议见 plans/training.md：训练 objective 不变；训练前冻结独立开局与
+跨年代历史对手。120 局验证选择唯一候选，再执行一次性独立留出。
+仅双阶段通过时受保护地写回权重；新旧协议 cost 不可跨运行比较。
 """
 import argparse
 import ast
@@ -28,9 +19,12 @@ from optimization.config import OptimizationConfig
 from optimization.ncs.optimizer import NCSConfig, NCSOptimizer
 from optimization.parameter_space import ParameterSpace
 from reversi.agent import BASELINE_WEIGHTS
+from reversi.search import SEARCH_POLICY
 
 from .match_runner import SEARCH_MAX_DEPTH, SEARCH_NODE_LIMIT, MatchRunner
 from .reversi_objective import ReversiObjective
+from .validation import (PROTOCOL_VERSION, compare_holdout, evaluate_once, evaluate_weights,
+                         freeze_protocol, select_opponents)
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _ARTIFACTS_DIR = os.path.join(_PROJECT_ROOT, "artifacts")
@@ -69,6 +63,8 @@ _SOURCE_FILES = [
     "reversi/search.py",
     "experiments/match_runner.py",
     "experiments/reversi_objective.py",
+    "experiments/validation.py",
+    "experiments/plan9.py",
     "optimization/ncs/optimizer.py",
 ]
 
@@ -275,12 +271,15 @@ def update_submission_weights(new_weights, logger: Logger) -> Dict:
 
 
 def validate_weights(weights, runner: MatchRunner, incumbent_weights,
-                     opponent_weights_list, greedy_seed=POOL_GREEDY_SEED) -> Dict:
-    """24 局验证协议（方向一）：8 局自对弈（vs 现任冠军）+ 16 局固定池（3 冠军 + 反转贪心）。
+                     opponent_weights_list, greedy_seed=POOL_GREEDY_SEED,
+                     protocol=None, phase="validation") -> Dict:
+    """显式 protocol 使用 v2；无 protocol 仅兼容历史 24 局重放/测试，不用于晋级。
 
     mean_u = 24 局 u 平均；cost = (1 - mean_u)/2。
     self_play_mean_u = 8 局自对弈 u 平均（晋级门槛条件②用）。
     """
+    if protocol is not None:
+        return evaluate_weights(weights, runner, protocol, phase)
     weights = np.asarray(weights, dtype=np.float64)
     incumbent = np.asarray(incumbent_weights, dtype=np.float64)
     result = runner.validate_protocol(weights, incumbent, opponent_weights_list, greedy_seed=greedy_seed)
@@ -293,6 +292,7 @@ def validate_weights(weights, runner: MatchRunner, incumbent_weights,
     losses = int(np.count_nonzero(u_arr < 0))
     draws = int(np.count_nonzero(u_arr == 0))
     return {
+        "protocol_version": "legacy_repeated_initial_v1",
         "weights": weights.tolist(),
         "wins": wins,
         "draws": draws,
@@ -330,32 +330,24 @@ def load_champion_pool() -> List[Dict]:
 
 
 def select_fixed_opponents(champions: List[Dict], incumbent_weights, logger: Logger) -> List[list]:
-    """从冠军池选择固定对手：不含现任冠军，按 validation_cost 升序取前 3。"""
-    incumbent_arr = np.asarray(incumbent_weights, dtype=np.float64)
-    non_current = []
-    for c in champions:
-        try:
-            w = np.asarray(c.get("weights"), dtype=np.float64)
-        except (TypeError, ValueError):
-            continue
-        if w.shape == (5,) and not np.allclose(w, incumbent_arr):
-            non_current.append(c)
-    non_current.sort(key=lambda c: c.get("validation_cost", 1.0))
-    top3 = non_current[:3]
-    logger.log(
-        f"[pool] fixed opponents (top3 by cost) = {[c.get('cycle_index') for c in top3]}"
-    )
-    return [c["weights"] for c in top3]
+    """有效且不同权重的历史冠军中选最早/中位/最近；不用旧 cost 排序。"""
+    selected = select_opponents(champions, incumbent_weights)
+    logger.log(f"[pool] chronological anchors = {[c['cycle_index'] for c in selected]}")
+    return [c["weights"] for c in selected]
 
 
 def append_champion_to_pool(champions: List[Dict], cycle_index: int, winner_weights,
-                            winner_validation_cost: float, logger: Logger) -> None:
-    """把新冠军追加进池（validation_cost = 其 24 局验证 cost）。"""
+                            winner_validation_cost: float, logger: Logger,
+                            protocol=None) -> None:
+    """追加冠军并标记分数协议；历史条目原样保留，不按混合 cost 排序。"""
     entry = {
         "cycle_index": cycle_index,
         "weights": [float(x) for x in np.asarray(winner_weights, dtype=np.float64)],
         "validation_cost": float(winner_validation_cost),
         "promoted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "validation_protocol": PROTOCOL_VERSION if protocol else "legacy_repeated_initial_v1",
+        "search_policy": SEARCH_POLICY,
+        "validation_protocol_sha256": protocol["sha256"] if protocol else None,
     }
     champions.append(entry)
     champions.sort(key=lambda c: c.get("cycle_index", 0))
@@ -473,7 +465,7 @@ def run_plan9_cycle(
     """执行一个完整 Plan 9 周期，返回 promotion 报告。
 
     selfplay=True 时，训练 objective 的固定陪练从 baseline 权重换成当前 incumbent
-    冠军权重（self-play 自我迭代训练目标），验证/H2H/晋级规则不变。
+    冠军权重（self-play 自我迭代训练目标），独立验证不进入 optimizer objective。
     """
     run_dir = os.path.join(_TRAINING_RUNS_DIR, run_id)
     os.makedirs(run_dir, exist_ok=True)
@@ -484,9 +476,11 @@ def run_plan9_cycle(
     backup_meta = backup_submission(logger, version)
     source_hashes = {p: sha256_file(os.path.join(_PROJECT_ROOT, p)) for p in _SOURCE_FILES}
 
-    # 冠军池：读取历史冠军，选择固定对手（不含现任冠军，按 validation_cost 升序取前 3）。
+    # 训练前冻结；禁止按候选成绩选样本/对手，缺失/无效冠军池立即失败。
     champions = load_champion_pool()
     fixed_opponent_weights = select_fixed_opponents(champions, incumbent_weights, logger)
+    protocol = freeze_protocol(_PROJECT_ROOT, run_dir, run_id, incumbent_weights,
+                               champions, DEPTH, SEARCH_NODE_LIMIT)
 
     # 训练 objective 配置（selfplay 4 冠军 + 2 贪心，match 2 baseline + 4 贪心）。
     if selfplay:
@@ -525,7 +519,11 @@ def run_plan9_cycle(
         "training_greedy_seeds": list(training_greedy_seeds),
         "baseline_weight": baseline_weight,
         "greedy_weight": greedy_weight,
-        "validation_protocol": "24 games: 8 selfplay vs incumbent (4W+4B) + 16 fixed pool (3 champions + greedy, 2W+2B each)",
+        "validation_protocol": PROTOCOL_VERSION,
+        "validation_protocol_sha256": protocol["sha256"],
+        "validation_games_per_model": protocol["games_per_model"],
+        "validation_frequency": "once per completed optimization; never per objective evaluation",
+        "holdout_policy": protocol["stopping_rule"],
         "champion_pool": [
             {"cycle_index": c["cycle_index"], "validation_cost": c["validation_cost"]}
             for c in champions
@@ -533,7 +531,7 @@ def run_plan9_cycle(
         "fixed_opponent_weights": [list(w) for w in fixed_opponent_weights],
         "pool_greedy_seed": POOL_GREEDY_SEED,
         "search_depth": DEPTH,
-        "search_policy": "iterative_completed_iterations_v1",
+        "search_policy": SEARCH_POLICY,
         "search_node_limit": SEARCH_NODE_LIMIT,
         "search_endgame_policy": "bounded_iterations_then_terminal_depth_at_14_empties",
         "source_hashes": source_hashes,
@@ -605,7 +603,7 @@ def run_plan9_cycle(
         json.dump(training_summary, f, indent=2, ensure_ascii=False)
     logger.log(
         f"[train] done: best_cost={result.best_cost:.9f} "
-        f"evals={result.num_evaluations} games={result.num_evaluations * 6} "
+        f"evals={result.num_evaluations} games={result.num_evaluations * games_per_eval} "
         f"elapsed={train_elapsed:.1f}s"
     )
     logger.log(f"[train] BestFound weights={np.round(challenger_weights, 9).tolist()}")
@@ -640,11 +638,11 @@ def run_plan9_cycle(
             },
         })
 
-    # Step 4：24 局验证协议（incumbent + 每个 challenger）。
-    logger.log("[validation] 24-game protocol (incumbent + challengers) ...")
+    # Step 4：独立开局验证，所有模型相同开局/对手/颜色；只在优化完成后调用。
+    logger.log("[validation] v2 independent openings, 120 games/model ...")
     runner = MatchRunner(depth=DEPTH)
-    incumbent_validation = validate_weights(
-        incumbent_weights, runner, incumbent_weights, fixed_opponent_weights, POOL_GREEDY_SEED
+    incumbent_validation = evaluate_once(
+        incumbent_weights, runner, protocol, run_dir, "incumbent"
     )
     incumbent_cost = incumbent_validation["cost"]
     with open(os.path.join(run_dir, "incumbent_validation.json"), "w", encoding="utf-8") as f:
@@ -657,8 +655,8 @@ def run_plan9_cycle(
     )
 
     for ch in challengers:
-        ch["validation"] = validate_weights(
-            ch["weights"], runner, incumbent_weights, fixed_opponent_weights, POOL_GREEDY_SEED
+        ch["validation"] = evaluate_once(
+            ch["weights"], runner, protocol, run_dir, ch["kind"]
         )
         ch["validation_cost"] = ch["validation"]["cost"]
         ch["self_play_mean_u"] = ch["validation"]["self_play_mean_u"]
@@ -669,7 +667,7 @@ def run_plan9_cycle(
             f"self_play_mean_u={ch['self_play_mean_u']:.6f} "
             f"W/D/L={ch['validation']['wins']}/{ch['validation']['draws']}/{ch['validation']['losses']}"
         )
-        # 晋级门槛：① 24 局 cost 严格低于 incumbent；② 对现任冠军 8 局 mean_u > 0。
+        # 第一阶段筛选，不等于已取得一次性留出晋级许可。
         ch["qualified"] = (
             ch["validation_cost"] < incumbent_cost
             and ch["self_play_mean_u"] > 0.0
@@ -688,7 +686,7 @@ def run_plan9_cycle(
         with open(os.path.join(run_dir, "preference_candidate_validation.json"), "w", encoding="utf-8") as f:
             json.dump(pref_val, f, indent=2, ensure_ascii=False)
 
-    # Step 5：晋级门槛已在 Step 4 判定（24 局 cost + 8 局自对弈 mean_u）。
+    # Step 5：记录验证阶段筛选（不是留出结果）。
     for ch in challengers:
         label = ch["candidate_id"] or "match_ncs_candidate"
         if not ch["qualified"]:
@@ -717,6 +715,25 @@ def run_plan9_cycle(
         ))
         winner = qualified[0]
 
+    # 唯一候选固定后才消耗留出。失败即停止，不换第二名，不增加开局。
+    holdout_report = None
+    finalist = winner
+    if finalist is not None:
+        selection = {"kind": finalist["kind"], "candidate_id": finalist["candidate_id"],
+                     "weights": finalist["weights"].tolist(), "protocol_sha256": protocol["sha256"]}
+        with open(os.path.join(run_dir, "holdout_finalist.json"), "x", encoding="utf-8") as f:
+            json.dump(selection, f, indent=2)
+        holdout_incumbent = evaluate_once(incumbent_weights, runner, protocol, run_dir,
+                                         "incumbent", phase="holdout")
+        holdout_candidate = evaluate_once(finalist["weights"], runner, protocol, run_dir,
+                                         "finalist", phase="holdout")
+        holdout_report = compare_holdout(holdout_candidate, holdout_incumbent)
+        with open(os.path.join(run_dir, "holdout_gate.json"), "x", encoding="utf-8") as f:
+            json.dump(holdout_report, f, indent=2)
+        logger.log(f"[holdout] {holdout_report}")
+        if not holdout_report["passed"]:
+            winner = None
+
     # Step 7：更新 submission（仅 winner）。
     update_applied = False
     old_version = version
@@ -737,13 +754,15 @@ def run_plan9_cycle(
             logger.log(f"[promote] writeback FAILED: {exc}")
             reason = "promotion qualified but submission writeback failed"
     else:
-        reason = "no challenger passed validation gate (24-game cost + self-play mean_u)"
+        reason = ("selected finalist failed single-use independent holdout" if finalist is not None
+                  else "no challenger passed independent validation selection gate")
         logger.log("[promote] no winner -> keep incumbent (no update)")
     if winner is not None and update_applied:
         reason = None
-        # 把新冠军追加进冠军池（validation_cost = 其 24 局验证 cost）。
+        # 保存验证阶段 cost 与协议标识，留出完整记录单独保存。
         append_champion_to_pool(
-            champions, cycle_index, winner["weights"], winner["validation_cost"], logger
+            champions, cycle_index, winner["weights"], winner["validation_cost"], logger,
+            protocol=protocol,
         )
 
     # Step 8：记录偏好候选消费状态（无论通过还是拒绝）。
@@ -756,6 +775,10 @@ def run_plan9_cycle(
         record_preference_candidate_evaluated(pref["candidate_id"], outcome, logger)
 
     promotion = {
+        "validation_protocol": PROTOCOL_VERSION,
+        "validation_protocol_sha256": protocol["sha256"],
+        "search_policy": SEARCH_POLICY,
+        "holdout": holdout_report,
         "promoted": winner is not None and update_applied,
         "update_applied": update_applied,
         "old_version": old_version,

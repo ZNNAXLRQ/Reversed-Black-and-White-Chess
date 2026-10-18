@@ -183,6 +183,7 @@ UPPER = 2
 ENDGAME_EMPTY_THRESHOLD = 14
 _TT_SIZE = 1 << 16
 _MAX_DEPTH = 64
+SEARCH_POLICY = "iterative_root_pv_tt_v2"
 
 def _new_state():
     return {
@@ -198,6 +199,7 @@ def _new_state():
         "deadline": np.zeros(1, dtype=np.float64),
         "node_limit": np.zeros(1, dtype=np.int64),
         "weights": np.zeros(5, dtype=np.float64),
+        "root_pv": np.full(1, -1, dtype=np.int8),
     }
 
 @numba.njit
@@ -252,6 +254,18 @@ def _order_moves_nb(moves_mask, depth, color, killers, history):
     return moves, cnt
 
 @numba.njit
+def _promote_hint(moves, count, hint):
+    """合法提示走法优先，其余走法维持原相对次序。"""
+    if hint < 0 or hint >= 64:
+        return
+    for index in range(count):
+        if moves[index] == hint:
+            for j in range(index, 0, -1):
+                moves[j] = moves[j - 1]
+            moves[0] = hint
+            return
+
+@numba.njit
 def _negamax_nb(me, opp, color, depth, alpha, beta, weights,
                 tt_key, tt_depth, tt_flag, tt_val, tt_move,
                 killers, history, nodes, abort, node_limit, solve_endgame=True):
@@ -293,6 +307,9 @@ def _negamax_nb(me, opp, color, depth, alpha, beta, weights,
     moves, cnt = _order_moves_nb(moves_mask, depth, color, killers, history)
 
     orig_alpha = alpha
+    # 浅层条目也可提供排序提示，但仍须完整 key 匹配并通过合法列表检查。
+    if tt_depth[idx] >= 0 and tt_key[idx] == key:
+        _promote_hint(moves, cnt, int(tt_move[idx]))
     best = -1e300
     best_move = -1
     ci = 0 if color < 0 else 1
@@ -337,11 +354,12 @@ def _negamax_nb(me, opp, color, depth, alpha, beta, weights,
 @numba.njit
 def _best_move_nb(me, opp, color, depth, weights,
                   tt_key, tt_depth, tt_flag, tt_val, tt_move,
-                  killers, history, nodes, abort, node_limit, solve_endgame=True):
+                  killers, history, nodes, abort, node_limit, solve_endgame=True, root_pv=-1):
     moves_mask = _legal_mask_nb(me, opp)
     if moves_mask == np.uint64(0):
         return -1
     moves, cnt = _order_moves_nb(moves_mask, depth, color, killers, history)
+    _promote_hint(moves, cnt, root_pv)
     best = moves[0]
     best_score = -1e300
     alpha = -1e300
@@ -371,6 +389,7 @@ def _to_coord(mi):
     return int(mi) // 8, int(mi) % 8
 
 def _prepare(state, weights, time_budget, node_limit):
+    state["root_pv"].fill(-1)
     state["tt_depth"].fill(-1)
     state["tt_move"].fill(-1)
     state["killers"].fill(-1)
@@ -389,7 +408,7 @@ def _run(state, me, opp, color, depth, solve_endgame=True):
         me, opp, color, depth, state["weights"],
         state["tt_key"], state["tt_depth"], state["tt_flag"], state["tt_val"], state["tt_move"],
         state["killers"], state["history"], state["nodes"], state["abort"],
-        state["node_limit"], solve_endgame,
+        state["node_limit"], solve_endgame, state["root_pv"][0],
     )
 
 def best_move(bb, color, depth, weights, time_budget=None, node_limit=None):
@@ -431,6 +450,7 @@ def best_move_iterative(bb, color, max_depth, weights, time_budget=None, node_li
             break
         if mi >= 0:
             best = _to_coord(mi)
+            state["root_pv"][0] = mi
             result["completed_depth"] = d
         if d >= empties:
             result.update(terminal_solved=True, stop_reason="terminal_solved")
@@ -446,7 +466,7 @@ _SEARCH_DEPTH = 10
 
 # BEGIN AUTO-UPDATED FINAL WEIGHTS
 _FIXED_WEIGHTS = np.array(
-    [-0.6033475472115732, -10.0, 1.4433786818495893, -5.322109390395889, -8.180184680675023],
+    [-6.334815803928683, -5.959005380883541, 2.133013254455287, -10.0, -8.291851370348118],
     dtype=np.float64,
 )
 # END AUTO-UPDATED FINAL WEIGHTS

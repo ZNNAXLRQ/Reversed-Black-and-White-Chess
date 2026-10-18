@@ -33,6 +33,8 @@ class GameResult:
     elapsed: float
     seed: Optional[int] = None
     search_stats: List[dict] = field(default_factory=list)
+    trace: List[dict] = field(default_factory=list)
+    final_board: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -112,18 +114,23 @@ class MatchRunner:
         self.depth = depth
         self.node_limit = node_limit
 
-    def play_game(self, black_agent, white_agent, seed=None) -> GameResult:
-        board = initial_board()
-        color = COLOR_BLACK
+    def play_game(self, black_agent, white_agent, seed=None, opening=None) -> GameResult:
+        # 独立验证从冻结的合法前缀续弈；训练默认入口及计分保持不变。
+        if opening is None:
+            board, color = initial_board(), COLOR_BLACK
+        else:
+            from .validation import replay_opening
+            board, color = replay_opening(opening)
         steps = 0
         search_stats = []
+        trace = []
         start = time.time()
         try:
             while not is_terminal(board):
                 moves = legal_moves(board, color)
                 if moves:
                     agent = black_agent if color == COLOR_BLACK else white_agent
-                    move = agent.select_move(board, color, moves, seed)
+                    move = agent.select_move(board.copy(), color, moves, seed)
                     if isinstance(agent, WeightedAgent):
                         search_stats.append(dict(color=color, **agent.last_search_stats))
                     if move not in moves:
@@ -133,6 +140,9 @@ class MatchRunner:
                         )
                     board = apply_move(board, color, move)
                     steps += 1
+                    trace.append({"color": color, "move": list(move)})
+                else:
+                    trace.append({"color": color, "move": None})
                 color = opponent(color)
                 if steps > 200:
                     raise ObjectiveEvaluationError(f"game exceeded 200 steps; board=\n{board}")
@@ -150,6 +160,8 @@ class MatchRunner:
             elapsed=elapsed,
             seed=seed,
             search_stats=search_stats,
+            trace=trace,
+            final_board=[int(x) for x in board],
         )
 
     def evaluate_candidate(self, weights, baseline_weights, greedy_seeds=(101, 202),
