@@ -255,7 +255,7 @@ def _order_moves_nb(moves_mask, depth, color, killers, history):
 
 @numba.njit
 def _promote_hint(moves, count, hint):
-    """合法提示走法优先，其余走法维持原相对次序。"""
+    # TT走法优先
     if hint < 0 or hint >= 64:
         return
     for index in range(count):
@@ -307,7 +307,7 @@ def _negamax_nb(me, opp, color, depth, alpha, beta, weights,
     moves, cnt = _order_moves_nb(moves_mask, depth, color, killers, history)
 
     orig_alpha = alpha
-    # 浅层条目也可提供排序提示，但仍须完整 key 匹配并通过合法列表检查。
+    # 浅层条目也可提供排序提示，但仍须完整 key 匹配并通过合法列表检查
     if tt_depth[idx] >= 0 and tt_key[idx] == key:
         _promote_hint(moves, cnt, int(tt_move[idx]))
     best = -1e300
@@ -443,7 +443,7 @@ def best_move_iterative(bb, color, max_depth, weights, time_budget=None, node_li
         if time_budget is not None and time_budget > 0 and time.time() >= state["deadline"][0]:
             result.update(interrupted=True, stop_reason="time_budget")
             break
-        # TT 只在同一种叶节点评估语义下复用：不在浅层偷偷切换到强制解终局。
+        # TT 只在同一种叶节点评估语义下复用：不在浅层偷偷切换到强制解终局
         mi = _run(state, me, opp, color, d, solve_endgame=False)
         if state["abort"][0] != 0:
             result.update(interrupted=True, stop_reason="node_limit")
