@@ -125,3 +125,38 @@ def test_best_candidate_not_shared_across_runs():
     assert r2.best_candidate[0] != 999.0
 
 
+def test_champion_initialization_rescored_and_preserves_random_slots():
+    space = ParameterSpace([0.] * 5, [1.] * 5)
+    seed = np.full(5, .3)
+    seen = []
+
+    def objective(x):
+        seen.append(x.copy())
+        return EvaluationResult(cost=float(np.sum((x - .3) ** 2)))
+
+    optimizer = NCSOptimizer(NCSConfig(T_max=1, population_size=10, initial_candidates=[seed]))
+    result = optimizer.optimize(objective, space, OptimizationConfig(seed=900025))
+    random = make_optimizer(T_max=0, population_size=10).optimize(
+        Sphere(), space, OptimizationConfig(seed=900025))
+    assert np.array_equal(seen[0], seed)
+    assert result.metrics["initial_population"][1:] == random.metrics["initial_population"][1:]
+    assert result.metrics["seeded_processes"] == 1
+    assert result.num_evaluations == len(seen) == 20
+    assert result.best_cost == 0
+    assert not np.array_equal(seen[10], seen[0])  # Seed participates in ordinary Gaussian mutation.
+    assert len(result.metrics["acceptance_rate_history"]) == 1
+    seed[:] = 999
+    assert result.metrics["initial_population"][0] == [.3] * 5
+
+
+@pytest.mark.parametrize("seeds", [[[2.] * 5], [[float("nan")] * 5], [[0.] * 4],
+                                 [[0.] * 5] * 4])
+def test_invalid_initial_candidates_fail_before_any_evaluation(seeds):
+    called = []
+    opt = NCSOptimizer(NCSConfig(T_max=0, population_size=3, initial_candidates=seeds))
+    with pytest.raises(ValueError, match="initial_candidates"):
+        opt.optimize(lambda x: called.append(x), ParameterSpace([0.] * 5, [1.] * 5),
+                     OptimizationConfig(seed=900025))
+    assert called == []
+
+

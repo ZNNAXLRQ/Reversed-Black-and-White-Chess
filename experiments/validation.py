@@ -76,7 +76,7 @@ def prior_positions(root):
 
     artifacts = root / "artifacts"
     names = {"samples.json", "openings.json", "deployment_final_openings.json",
-             "validation_protocol.json"}
+             "validation_protocol.json", "continuation_protocol.json"}
     for path in artifacts.rglob("*.json"):
         if path.name in names:
             collect(json.loads(path.read_text(encoding="utf-8-sig")))

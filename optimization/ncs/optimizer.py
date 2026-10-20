@@ -8,6 +8,7 @@ p < 0.2 时 sigma *= r，p == 0.2 不变）；论文正文文字解释与公式�
 Bhattacharyya 距离按投影后中心与原 sigma 对应的名义高斯分布计算。
 """
 from dataclasses import dataclass
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -32,6 +33,7 @@ class NCSConfig:
     sigma0: float = 0.1
     r: float = 0.99
     epoch: int = 10
+    initial_candidates: Optional[Sequence] = None
 
     def __post_init__(self):
         if self.T_max < 0:
@@ -116,10 +118,19 @@ class NCSOptimizer(Optimizer):
                 f"max_evaluations={max_evals} insufficient for initialization ({init_evals})"
             )
 
-        # 初始化（计入预算）
+        # 保留全部随机抽样的 RNG 次序，再替换显式种子槽位，便于同种子消融。
+        initial = [parameter_space.sample(rng) for _ in range(n)]
+        seeds = [] if nc.initial_candidates is None else list(nc.initial_candidates)
+        if len(seeds) > n:
+            raise ValueError("initial_candidates exceeds population_size")
+        for i, candidate in enumerate(seeds):
+            if not parameter_space.validate(candidate):
+                raise ValueError("initial_candidates must be finite and within parameter bounds")
+            initial[i] = np.asarray(candidate, dtype=np.float64).copy()
+
+        # 所有初始中心均按本轮 objective 重新计分，不导入冠军的历史 cost。
         processes = []
-        for _ in range(n):
-            x = parameter_space.sample(rng)
+        for x in initial:
             cost = float(objective(x).cost)
             processes.append(SearchProcess(x=x, cost=cost, sigma=nc.sigma0))
         num_evals = init_evals
@@ -200,6 +211,8 @@ class NCSOptimizer(Optimizer):
                 "sigma_mean_history": sigma_mean_history,
                 "acceptance_rate_history": acceptance_rate_history,
                 "initial_best_z": initial_best_z.tolist(),
+                "initial_population": [x.tolist() for x in initial],
+                "seeded_processes": len(seeds),
             },
         )
 

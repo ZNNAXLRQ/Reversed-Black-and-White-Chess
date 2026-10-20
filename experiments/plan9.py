@@ -1,7 +1,7 @@
 """Plan 9：重复 NCS 训练、候选晋级与提交代码更新（单周期执行入口）。
 
-当前协议见 plans/training.md：训练 objective 不变；训练前冻结独立开局与
-跨年代历史对手。120 局验证选择唯一候选，再执行一次性独立留出。
+当前协议见 plans/training.md：日常训练使用棋谱局面续弈，旧目标仅兼容历史实验。
+训练前冻结独立开局与跨年代历史对手。120 局验证后执行一次性独立留出。
 仅双阶段通过时受保护地写回权重；新旧协议 cost 不可跨运行比较。
 """
 import argparse
@@ -22,6 +22,8 @@ from reversi.agent import BASELINE_WEIGHTS
 from reversi.search import SEARCH_POLICY
 
 from .match_runner import SEARCH_MAX_DEPTH, SEARCH_NODE_LIMIT, MatchRunner
+from .continuation_dataset import DEFAULT_POSITIONS, VERSION as CONTINUATION_VERSION, freeze_training
+from .continuation_objective import ContinuationObjective
 from .reversi_objective import ReversiObjective
 from .validation import (PROTOCOL_VERSION, compare_holdout, evaluate_once, evaluate_weights,
                          freeze_protocol, select_opponents)
@@ -63,6 +65,8 @@ _SOURCE_FILES = [
     "reversi/search.py",
     "experiments/match_runner.py",
     "experiments/reversi_objective.py",
+    "experiments/continuation_dataset.py",
+    "experiments/continuation_objective.py",
     "experiments/validation.py",
     "experiments/plan9.py",
     "optimization/ncs/optimizer.py",
@@ -98,7 +102,10 @@ class LoggingObjective:
     def __call__(self, candidate):
         result = self.objective(candidate)
         self.count += 1
-        self.logger.log(f"[ncs] eval {self.count}/{self.total} cost={result.cost:.9f}")
+        detail = ""
+        if "incumbent_mean_u" in result.metrics:
+            detail = f" incumbent_mean_u={result.metrics['incumbent_mean_u']:.6f}"
+        self.logger.log(f"[ncs] eval {self.count}/{self.total} cost={result.cost:.9f}{detail}")
         return result
 
 
@@ -461,12 +468,18 @@ def run_plan9_cycle(
     run_id: str,
     logger: Logger,
     selfplay: bool = False,
+    dataset_manifest: Optional[str] = None,
+    position_count: int = DEFAULT_POSITIONS,
+    initialization: str = "champion_random",
 ) -> Dict:
     """执行一个完整 Plan 9 周期，返回 promotion 报告。
 
-    selfplay=True 时，训练 objective 的固定陪练从 baseline 权重换成当前 incumbent
-    冠军权重（self-play 自我迭代训练目标），独立验证不进入 optimizer objective。
+    指定 dataset_manifest 启用棋谱续弈；未指定仅保留旧 API 的历史目标语义。
+    CLI 日常默认要求清单。独立验证不进入 optimizer objective。
     """
+    continuation = dataset_manifest is not None
+    if initialization not in ("champion_random", "random"):
+        raise ValueError("initialization must be champion_random or random")
     run_dir = os.path.join(_TRAINING_RUNS_DIR, run_id)
     os.makedirs(run_dir, exist_ok=True)
 
@@ -482,8 +495,16 @@ def run_plan9_cycle(
     protocol = freeze_protocol(_PROJECT_ROOT, run_dir, run_id, incumbent_weights,
                                champions, DEPTH, SEARCH_NODE_LIMIT)
 
-    # 训练 objective 配置（selfplay 4 冠军 + 2 贪心，match 2 baseline + 4 贪心）。
-    if selfplay:
+    training_protocol = None
+    if continuation:
+        training_protocol = freeze_training(
+            _PROJECT_ROOT, run_dir, dataset_manifest, training_seed, position_count,
+            incumbent_weights, champions, DEPTH, SEARCH_NODE_LIMIT, protocol, initialization,
+        )
+        training_greedy_seeds = ()
+        baseline_weight = greedy_weight = None
+        games_per_eval = training_protocol["games_per_evaluation"]
+    elif selfplay:
         training_greedy_seeds = (TRAINING_GREEDY_SEEDS[0],)
         baseline_weight = 2.0
         greedy_weight = 1.0
@@ -504,9 +525,15 @@ def run_plan9_cycle(
         "feature_names": FEATURE_NAMES,
         "weight_bounds": [WEIGHT_LOWER, WEIGHT_UPPER],
         "decode": "w = -10 + 20*z, z in [0,1]^5",
-        "objective_version": "cost=(1-mean_u)/2; u_g=(opp_count-own_count)/64 (candidate perspective)",
-        "objective_mode": "selfplay" if selfplay else "match",
-        "training_opponent_weights": incumbent_weights.tolist() if selfplay else BASELINE_LIST,
+        "objective_version": (CONTINUATION_VERSION if continuation else
+                              "cost=(1-mean_u)/2; u_g=(opp_count-own_count)/64 (candidate perspective)"),
+        "objective_mode": "continuation" if continuation else ("selfplay" if selfplay else "match"),
+        "training_protocol_sha256": training_protocol["sha256"] if continuation else None,
+        "initialization": initialization if continuation else "random",
+        "training_opponent_weights": (None if continuation else
+                                      (incumbent_weights.tolist() if selfplay else BASELINE_LIST)),
+        "training_opponents": training_protocol["opponents"] if continuation else None,
+        "dataset_manifest": training_protocol["dataset_manifest"] if continuation else None,
         "ncs_params": {
             "population_size": POPULATION_SIZE,
             "T_max": T_MAX,
@@ -516,6 +543,9 @@ def run_plan9_cycle(
         },
         "candidate_evaluations": POPULATION_SIZE * (T_MAX + 1),
         "objective_games": POPULATION_SIZE * (T_MAX + 1) * games_per_eval,
+        "objective_games_are_budget": True,
+        "games_per_evaluation": games_per_eval,
+        "legacy_preference_candidates_enabled": not continuation,
         "training_greedy_seeds": list(training_greedy_seeds),
         "baseline_weight": baseline_weight,
         "greedy_weight": greedy_weight,
@@ -547,13 +577,19 @@ def run_plan9_cycle(
     )
     logger.log(f"[config] incumbent_weights={np.round(incumbent_weights, 6).tolist()}")
     logger.log(f"[config] baseline_weights={BASELINE_LIST}")
-    if selfplay:
+    if continuation:
+        logger.log(f"[config] continuation positions={position_count} games/eval={games_per_eval} "
+                   f"game_budget={config['objective_games']} initialization={initialization}")
+    elif selfplay:
         logger.log(f"[config] selfplay opponent=incumbent weights={np.round(incumbent_weights, 6).tolist()}")
 
-    # Step 2：NCS 训练。self-play 模式用当前冠军做固定陪练（4 冠军 + 2 贪心），
-    # 否则用固定 baseline（2 baseline + 4 贪心）。
+    # Step 2：固定整轮训练面板；旧目标只用于显式历史兼容。
     space = ParameterSpace([0.0] * 5, [1.0] * 5)
-    if selfplay:
+    if continuation:
+        objective = ContinuationObjective(
+            training_protocol, audit_path=os.path.join(run_dir, "continuation_games.jsonl"),
+        )
+    elif selfplay:
         objective = ReversiObjective(
             incumbent_weights, depth=DEPTH, greedy_seeds=training_greedy_seeds,
             baseline_weight=baseline_weight, greedy_weight=greedy_weight,
@@ -571,6 +607,8 @@ def run_plan9_cycle(
             sigma0=SIGMA0,
             r=R,
             epoch=EPOCH,
+            initial_candidates=([(incumbent_weights + 10.0) / 20.0]
+                                if continuation and initialization == "champion_random" else None),
         )
     )
     opt_config = OptimizationConfig(seed=training_seed)
@@ -594,6 +632,15 @@ def run_plan9_cycle(
         "num_iterations": result.num_iterations,
         "stop_reason": result.stop_reason,
         "objective_games": result.num_evaluations * games_per_eval,
+        "objective_games_are_budget": True,
+        "actual_objective_games": objective.games_played if continuation else None,
+        "objective_cache_hits": objective.cache_hits if continuation else None,
+        "objective_mode": config["objective_mode"],
+        "training_protocol_sha256": config["training_protocol_sha256"],
+        "initialization": config["initialization"],
+        "initial_population": result.metrics.get("initial_population"),
+        "seeded_processes": result.metrics.get("seeded_processes", 0),
+        "best_training_metrics": objective.cached_result(best_z).metrics if continuation else None,
         "elapsed_s": train_elapsed,
         "history": list(result.history),
         "sigma_mean_history": list(result.metrics.get("sigma_mean_history", [])),
@@ -609,7 +656,9 @@ def run_plan9_cycle(
     logger.log(f"[train] BestFound weights={np.round(challenger_weights, 9).tolist()}")
 
     # Step 3：构建 challenger 列表（总是 match_ncs_candidate；若存在合格偏好候选，另纳入）。
-    preference_candidate = select_preference_candidate(logger)
+    preference_candidate = None if continuation else select_preference_candidate(logger)
+    if continuation:
+        logger.log("[pref] disabled for continuation training; legacy artifacts preserved")
     challengers = [{
         "kind": "match_ncs",
         "candidate_id": None,
@@ -775,6 +824,8 @@ def run_plan9_cycle(
         record_preference_candidate_evaluated(pref["candidate_id"], outcome, logger)
 
     promotion = {
+        "objective_mode": config["objective_mode"],
+        "training_protocol_sha256": config["training_protocol_sha256"],
         "validation_protocol": PROTOCOL_VERSION,
         "validation_protocol_sha256": protocol["sha256"],
         "search_policy": SEARCH_POLICY,
@@ -827,15 +878,35 @@ def run_plan9_cycle(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plan 9 单周期执行入口")
-    parser.add_argument("--cycle-index", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=45)
+    parser.add_argument("--cycle-index", type=int, required=True)
+    parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--run-id", type=str, default=None)
-    parser.add_argument("--selfplay", action="store_true", help="self-play 训练目标（陪练=现任冠军）")
+    parser.add_argument("--training-mode", choices=("continuation", "legacy-selfplay", "legacy-match"),
+                        default=None, help="默认 continuation；旧目标仅供历史兼容")
+    parser.add_argument("--selfplay", action="store_true", help="历史 --training-mode legacy-selfplay 别名")
+    parser.add_argument("--dataset-manifest", help="现有整盘 train/validation/test 划分清单的绝对路径")
+    parser.add_argument("--positions", type=int, default=DEFAULT_POSITIONS,
+                        help="冻结局面数量，须为 3 的正倍数，默认 12")
+    parser.add_argument("--initialization", choices=("champion_random", "random"),
+                        default="champion_random", help="续弈初始化；random 用于隔离消融")
     args = parser.parse_args()
 
+    if args.selfplay and args.training_mode is not None:
+        parser.error("--selfplay cannot be combined with --training-mode")
+    mode = args.training_mode or ("legacy-selfplay" if args.selfplay else "continuation")
+    if args.cycle_index < 1 or args.seed < 0:
+        parser.error("cycle-index must be positive and seed non-negative")
+    if mode == "continuation":
+        if not args.dataset_manifest or not os.path.isfile(args.dataset_manifest):
+            parser.error("continuation requires an existing --dataset-manifest")
+        if args.positions < 3 or args.positions % 3:
+            parser.error("--positions must be a positive multiple of three")
+    elif args.dataset_manifest:
+        parser.error("legacy modes cannot use --dataset-manifest")
     cycle_index = args.cycle_index
     training_seed = args.seed
-    prefix = "selfplay_cycle" if args.selfplay else "ncs_cycle"
+    prefix = {"continuation": "continuation_cycle", "legacy-selfplay": "selfplay_cycle",
+              "legacy-match": "ncs_cycle"}[mode]
     run_id = args.run_id or f"{prefix}_{cycle_index:03d}_seed_{training_seed}"
 
     os.makedirs(_TRAINING_RUNS_DIR, exist_ok=True)
@@ -845,7 +916,11 @@ def main() -> None:
     os.makedirs(run_dir, exist_ok=True)
     logger = Logger(os.path.join(run_dir, "run.log"))
     try:
-        promotion = run_plan9_cycle(cycle_index, training_seed, run_id, logger, selfplay=args.selfplay)
+        promotion = run_plan9_cycle(
+            cycle_index, training_seed, run_id, logger, selfplay=mode == "legacy-selfplay",
+            dataset_manifest=args.dataset_manifest, position_count=args.positions,
+            initialization=args.initialization,
+        )
         logger.log("[summary] " + json.dumps(promotion, ensure_ascii=False))
     finally:
         logger.close()

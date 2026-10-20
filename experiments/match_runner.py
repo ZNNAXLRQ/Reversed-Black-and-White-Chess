@@ -115,7 +115,7 @@ class MatchRunner:
         self.node_limit = node_limit
 
     def play_game(self, black_agent, white_agent, seed=None, opening=None) -> GameResult:
-        # 独立验证从冻结的合法前缀续弈；训练默认入口及计分保持不变。
+        # 验证/棋谱续弈共用合法前缀校验，保留真实轮到方（包括必须 pass 的状态）。
         if opening is None:
             board, color = initial_board(), COLOR_BLACK
         else:
