@@ -89,7 +89,12 @@ def test_abort_preserves_last_completed_iteration(monkeypatch):
 
 def test_expired_deadline_is_observable(engine, monkeypatch):
     clock = iter([100.0, 102.0])
-    monkeypatch.setattr(time, 'time', lambda: next(clock))
+    if hasattr(engine, '_clock'):
+        # The low-memory deployment uses a monotonic clock and includes setup.
+        clock = iter([100.0, 100.0, 102.0])
+        monkeypatch.setattr(engine, '_clock', lambda: next(clock))
+    else:
+        monkeypatch.setattr(time, 'time', lambda: next(clock))
     stats = {}
     move = engine.best_move_iterative(initial_board(), COLOR_BLACK, 10, WEIGHTS,
                                       time_budget=1.0, stats=stats)
